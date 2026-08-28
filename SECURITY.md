@@ -14,8 +14,10 @@ Before attaching diagnostics to an issue, generate a redacted bundle:
 disk-health report --bundle disk-status-support.tar.gz --redact
 ```
 
+Redaction retains drive models and capacity/usage figures for diagnosis. It removes hostnames, serials, WWNs, device and mount paths, notes, and identity-bearing event details.
+
 Never publish `disk-health.json`, `baselines.json`, raw SMART dumps, or an unredacted support bundle.
 
 ## Reporting a vulnerability
 
-Please use GitHub's private vulnerability reporting for this repository. Do not open a public issue containing an exploit, disk identifiers, mount paths, or raw SMART output.
+After public release, use GitHub's **Report a vulnerability** button when it is available. If it is unavailable, contact the maintainer through the GitHub profile without including sensitive details and request a private reporting channel. Do not open a public issue containing an exploit, disk identifiers, mount paths, or raw SMART output.

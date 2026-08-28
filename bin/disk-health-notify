@@ -15,6 +15,7 @@ Two rules it exists to enforce:
     project exists to avoid.
 """
 
+import html
 import json
 import os
 import subprocess
@@ -50,10 +51,12 @@ def save_seen(ids):
 
 
 def notify(title, body, urgency="normal", icon="drive-harddisk"):
+    # Some notification servers interpret limited markup in message bodies.
+    safe_body = html.escape(str(body), quote=False)[:400]
     try:
         proc = subprocess.run(["notify-send", "--app-name=disk-health",
                                f"--urgency={urgency}", f"--icon={icon}",
-                               title, body], timeout=10, check=False)
+                               title, safe_body], timeout=10, check=False)
         if proc.returncode != 0:
             print(f"notify-send failed with exit {proc.returncode}", file=sys.stderr)
             return False

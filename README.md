@@ -124,6 +124,10 @@ disk-health report --bundle disk-status-support.tar.gz --redact
 disk-health report --json --redact --output report.json
 ```
 
+Redaction keeps drive models and capacity/usage figures because they are useful for diagnosis. It removes hostnames, serials, WWNs, device and mount paths, notes, and identity-bearing event details.
+
+If installation cannot reach `systemctl --user`, run it from a terminal inside your logged-in Omarchy desktop session so the user session bus is available.
+
 ## Architecture and resource use
 
 ```text

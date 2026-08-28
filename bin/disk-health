@@ -354,7 +354,7 @@ def read_diskstats():
 
 def io_targets(state):
     """device name -> display name, from the collector's own mapping so rows
-    read 'hdd1 (mirror)' rather than 'sda'."""
+    read 'archive (mirror)' rather than 'sda'."""
     out = {}
     for drive in state["drives"] + state.get("removable", []):
         dev = (drive.get("device") or "").removeprefix("/dev/")
@@ -515,11 +515,25 @@ def redacted_state(state):
 
 def create_support_bundle(path, state, redact=False):
     payload, mapping = redacted_state(state) if redact else (copy.deepcopy(state), {})
+    history_dir = os.path.join(STATE_DIR, "history")
+    history_entries = []
+    for drive in state.get("drives", []) + state.get("removable", []):
+        history_id = drive.get("history_id")
+        if not history_id:
+            continue
+        try:
+            with open(os.path.join(history_dir, f"{history_id}.csv"), encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        name = mapping.get(str(drive.get("serial")), history_id) if redact else history_id
+        history_entries.append((f"history/{name}.csv", content))
+
     manifest = {"format": "omarchy-disk-health-support-v1",
                 "created_from": payload.get("collected_at"),
                 "redacted": bool(redact),
-                "contents": ["report.json", "README.txt", "history/*.csv"]}
-    history_dir = os.path.join(STATE_DIR, "history")
+                "contents": ["report.json", "README.txt"]
+                            + [name for name, _ in history_entries]}
     with tarfile.open(path, "w:gz") as archive:
         def add_bytes(name, content):
             raw = content.encode("utf-8")
@@ -530,17 +544,8 @@ def create_support_bundle(path, state, redact=False):
         add_bytes("manifest.json", json.dumps(manifest, indent=2) + "\n")
         add_bytes("report.json", json.dumps(payload, indent=2) + "\n")
         add_bytes("README.txt", "Read-only diagnostic bundle. No SMART tests, scans, or raw device data were run.\n")
-        for drive in state.get("drives", []) + state.get("removable", []):
-            history_id = drive.get("history_id")
-            if not history_id:
-                continue
-            try:
-                with open(os.path.join(history_dir, f"{history_id}.csv"), encoding="utf-8") as fh:
-                    content = fh.read()
-            except OSError:
-                continue
-            name = mapping.get(str(drive.get("serial")), history_id) if redact else history_id
-            add_bytes(f"history/{name}.csv", content)
+        for name, content in history_entries:
+            add_bytes(name, content)
 
 
 def cmd_report(args):

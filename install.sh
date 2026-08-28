@@ -25,6 +25,11 @@ for command in python3 smartctl lsblk systemctl udevadm install getent; do
   fi
 done
 
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+  echo "Disk Status requires Python 3.11 or newer (found $(python3 --version 2>&1))." >&2
+  exit 1
+fi
+
 sudo install -Dm755 "${repo_dir}/bin/disk-health" /usr/local/bin/disk-health
 sudo install -Dm755 "${repo_dir}/bin/disk-health-collect" /usr/local/bin/disk-health-collect
 sudo install -Dm755 "${repo_dir}/bin/disk-health-notify" /usr/local/bin/disk-health-notify
@@ -51,7 +56,10 @@ sudo udevadm control --reload-rules
 sudo systemctl enable --now disk-health-collect.timer disk-health-collect.path
 sudo systemctl start disk-health-collect.service
 
-systemctl --user daemon-reload
+if ! systemctl --user daemon-reload; then
+  echo "Could not reach the systemd user session. Run the installer from your logged-in Omarchy desktop session." >&2
+  exit 1
+fi
 systemctl --user enable --now disk-health-notify.path disk-health-notify.timer
 
 echo

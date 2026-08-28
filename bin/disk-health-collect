@@ -555,10 +555,10 @@ def derive_kind(dev, data):
 def derive_title(dev, kind, capacity):
     """The card heading: what the thing IS, in the order you would say it.
 
-        HDD · ST22000NM001E-3HM103 · 22.0 TB
+        HDD · EXAMPLE-HDD-MODEL · 22.0 TB
 
     Separated with "·" rather than "-" because model numbers contain hyphens
-    and "HDD - ST22000NM001E-3HM103 - 22.0 TB" cannot be parsed by eye.
+    and "HDD - EXAMPLE-HDD-MODEL - 22.0 TB" cannot be parsed by eye.
 
     This does NOT identify a drive on its own — two identical disks give the
     same heading, which is exactly what CrystalDiskInfo's title bar does too.
@@ -843,7 +843,7 @@ def has_smart_evidence(data):
     `-d scsi` on a cheap USB bridge answers a SCSI INQUIRY and returns
     `model_name` with exit_status 4 and nothing else — no smart_status, no
     attributes, no temperature. Treating a model name as proof of SMART made
-    the MS06 render as a healthy 100 % drive at 0 °C, which is the exact
+    the USB bridge render as a healthy 100 % drive at 0 °C, which is the exact
     false-green this tool exists to prevent. Demand real evidence.
     """
     if not data:
