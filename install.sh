@@ -46,6 +46,17 @@ if [[ ! -e "${target_home}/.config/omarchy/disk-status.toml" ]]; then
     "${target_home}/.config/omarchy/disk-status.toml"
 fi
 
+old_seen_dir="${target_home}/.local/state/disk-health"
+new_seen_dir="${target_home}/.local/state/disk-status"
+if [[ -d "${old_seen_dir}" && ! -e "${new_seen_dir}" ]]; then
+  mv "${old_seen_dir}" "${new_seen_dir}"
+elif [[ -f "${old_seen_dir}/seen-events" && -f "${new_seen_dir}/seen-events" ]]; then
+  sort -u "${old_seen_dir}/seen-events" "${new_seen_dir}/seen-events" \
+    -o "${new_seen_dir}/seen-events"
+  rm -f "${old_seen_dir}/seen-events"
+  rmdir "${old_seen_dir}" 2>/dev/null || true
+fi
+
 if sudo test -d /var/lib/disk-health && ! sudo test -e /var/lib/disk-status; then
   sudo mv /var/lib/disk-health /var/lib/disk-status
 fi
@@ -79,6 +90,9 @@ sudo rm -f /usr/local/bin/disk-health /usr/local/bin/disk-health-collect /usr/lo
 sudo rm -f /etc/systemd/system/disk-health-collect.service \
   /etc/systemd/system/disk-health-collect.timer \
   /etc/systemd/system/disk-health-collect.path \
+  /etc/systemd/user/disk-health-notify.service \
+  /etc/systemd/user/disk-health-notify.path \
+  /etc/systemd/user/disk-health-notify.timer \
   /etc/udev/rules.d/99-disk-health.rules
 rm -f "${target_home}/.config/systemd/user/disk-health-notify.service" \
   "${target_home}/.config/systemd/user/disk-health-notify.path" \
