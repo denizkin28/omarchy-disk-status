@@ -54,7 +54,7 @@ def notify(title, body, urgency="normal", icon="drive-harddisk"):
     # Some notification servers interpret limited markup in message bodies.
     safe_body = html.escape(str(body), quote=False)[:400]
     try:
-        proc = subprocess.run(["notify-send", "--app-name=disk-health",
+        proc = subprocess.run(["notify-send", "--app-name=Disk Status",
                                f"--urgency={urgency}", f"--icon={icon}",
                                title, safe_body], timeout=10, check=False)
         if proc.returncode != 0:
