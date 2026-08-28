@@ -41,6 +41,11 @@ if [[ -e "${target_home}/.config/omarchy/disk-health.toml" \
   mv "${target_home}/.config/omarchy/disk-health.toml" \
     "${target_home}/.config/omarchy/disk-status.toml"
 fi
+if [[ -e "${target_home}/.config/omarchy/disk-health.toml.bak" \
+      && ! -e "${target_home}/.config/omarchy/disk-status.toml.bak" ]]; then
+  mv "${target_home}/.config/omarchy/disk-health.toml.bak" \
+    "${target_home}/.config/omarchy/disk-status.toml.bak"
+fi
 if [[ ! -e "${target_home}/.config/omarchy/disk-status.toml" ]]; then
   install -m644 "${repo_dir}/config/disk-status.toml.example" \
     "${target_home}/.config/omarchy/disk-status.toml"
