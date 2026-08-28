@@ -17,8 +17,5 @@
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
-  },
-  "omarchy": {
-    "clonedFrom": "omarchy.clock"
   }
 }

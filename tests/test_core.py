@@ -26,6 +26,10 @@ notifier = load_script("disk_status_notifier", "bin/disk-status-notify")
 
 
 class CoreTests(unittest.TestCase):
+    def test_plugin_is_independent_from_the_clock(self):
+        manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("clonedFrom", manifest.get("omarchy", {}))
+
     def test_used_percent_excludes_reserved_space(self):
         stat = types.SimpleNamespace(
             f_blocks=100, f_frsize=1, f_files=10, f_bavail=10, f_bfree=20
