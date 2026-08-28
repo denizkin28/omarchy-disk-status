@@ -1,0 +1,10 @@
+# Machine-specific collector fixture; may contain drive identifiers.
+sample-state.json
+
+# Internal review material, not part of the plugin distribution.
+FABLE-CODE-REVIEW-PROMPT.md
+
+# Local development and editor residue.
+*.bak
+*~
+.cache/
