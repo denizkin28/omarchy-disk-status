@@ -354,7 +354,7 @@ def read_diskstats():
 
 def io_targets(state):
     """device name -> display name, from the collector's own mapping so rows
-    read 'archive (mirror)' rather than 'sda'."""
+    read 'archive (mirror)' rather than a kernel device name."""
     out = {}
     for drive in state["drives"] + state.get("removable", []):
         dev = (drive.get("device") or "").removeprefix("/dev/")

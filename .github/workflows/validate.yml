@@ -18,6 +18,8 @@ jobs:
         run: python -m py_compile bin/disk-status bin/disk-status-collect bin/disk-status-notify
       - name: Run core regression tests
         run: python -m unittest discover -s tests -v
+      - name: Test installer migration and idempotency
+        run: bash tests/test_install.sh
       - name: Validate installer syntax
         run: bash -n install.sh
       - name: Reject private collector fixtures

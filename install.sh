@@ -2,9 +2,19 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+install_root="${DISK_STATUS_INSTALL_ROOT:-}"
+if [[ -n "${install_root}" && "${DISK_STATUS_TESTING:-}" != "1" ]]; then
+  echo "DISK_STATUS_INSTALL_ROOT is reserved for the test suite." >&2
+  exit 1
+fi
+state_parent="${install_root}/var/lib"
+local_bin_dir="${install_root}/usr/local/bin"
+system_unit_dir="${install_root}/etc/systemd/system"
+global_user_unit_dir="${install_root}/etc/systemd/user"
+udev_rules_dir="${install_root}/etc/udev/rules.d"
 target_user="${SUDO_USER:-${USER}}"
 target_group="$(id -gn "${target_user}")"
-target_home="$(getent passwd "${target_user}" | cut -d: -f6)"
+target_home="${DISK_STATUS_TARGET_HOME:-$(getent passwd "${target_user}" | cut -d: -f6)}"
 
 if [[ ${EUID} -eq 0 ]]; then
   echo "Run this installer as your normal desktop user, without sudo." >&2
@@ -42,6 +52,14 @@ if [[ -e "${target_home}/.config/omarchy/disk-health.toml" \
   mv "${target_home}/.config/omarchy/disk-health.toml" \
     "${target_home}/.config/omarchy/disk-status.toml"
 fi
+if [[ -e "${target_home}/.config/omarchy/disk-health.toml" ]]; then
+  preview_config="${target_home}/.config/omarchy/disk-status.toml.preview-backup"
+  if [[ ! -e "${preview_config}" ]]; then
+    mv "${target_home}/.config/omarchy/disk-health.toml" "${preview_config}"
+  else
+    echo "Legacy config retained at ${target_home}/.config/omarchy/disk-health.toml; preview backup already exists." >&2
+  fi
+fi
 if [[ -e "${target_home}/.config/omarchy/disk-health.toml.bak" \
       && ! -e "${target_home}/.config/omarchy/disk-status.toml.bak" ]]; then
   mv "${target_home}/.config/omarchy/disk-health.toml.bak" \
@@ -56,34 +74,51 @@ old_seen_dir="${target_home}/.local/state/disk-health"
 new_seen_dir="${target_home}/.local/state/disk-status"
 if [[ -d "${old_seen_dir}" && ! -e "${new_seen_dir}" ]]; then
   mv "${old_seen_dir}" "${new_seen_dir}"
-elif [[ -f "${old_seen_dir}/seen-events" && -f "${new_seen_dir}/seen-events" ]]; then
-  sort -u "${old_seen_dir}/seen-events" "${new_seen_dir}/seen-events" \
-    -o "${new_seen_dir}/seen-events"
+elif [[ -f "${old_seen_dir}/seen-events" ]]; then
+  install -d -m 0755 "${new_seen_dir}"
+  if [[ -f "${new_seen_dir}/seen-events" ]]; then
+    sort -u "${old_seen_dir}/seen-events" "${new_seen_dir}/seen-events" \
+      -o "${new_seen_dir}/seen-events"
+  else
+    mv "${old_seen_dir}/seen-events" "${new_seen_dir}/seen-events"
+  fi
   rm -f "${old_seen_dir}/seen-events"
   rmdir "${old_seen_dir}" 2>/dev/null || true
 fi
 
-if sudo test -d /var/lib/disk-health && ! sudo test -e /var/lib/disk-status; then
-  sudo mv /var/lib/disk-health /var/lib/disk-status
+old_state="${state_parent}/disk-health"
+new_state="${state_parent}/disk-status"
+if { sudo test -e "${old_state}" || sudo test -L "${old_state}"; } \
+   && ! sudo test -e "${new_state}"; then
+  sudo mv "${old_state}" "${new_state}"
+elif sudo test "${old_state}" -ef "${new_state}"; then
+  sudo rm -f "${old_state}"
+elif sudo test -e "${old_state}" || sudo test -L "${old_state}"; then
+  preview_state="${new_state}/preview-disk-health-state"
+  if ! sudo test -e "${preview_state}"; then
+    sudo mv "${old_state}" "${preview_state}"
+  else
+    echo "Legacy state retained at ${old_state}; preview backup already exists." >&2
+  fi
 fi
-sudo install -d -m 0750 -o "${target_user}" -g "${target_group}" /var/lib/disk-status
-if sudo test -e /var/lib/disk-status/disk-health.json \
-   && ! sudo test -e /var/lib/disk-status/disk-status.json; then
-  sudo mv /var/lib/disk-status/disk-health.json /var/lib/disk-status/disk-status.json
+sudo install -d -m 0750 -o "${target_user}" -g "${target_group}" "${new_state}"
+if sudo test -e "${new_state}/disk-health.json" \
+   && ! sudo test -e "${new_state}/disk-status.json"; then
+  sudo mv "${new_state}/disk-health.json" "${new_state}/disk-status.json"
 fi
-if sudo test -e /var/lib/disk-status/disk-health.log \
-   && ! sudo test -e /var/lib/disk-status/disk-status.log; then
-  sudo mv /var/lib/disk-status/disk-health.log /var/lib/disk-status/disk-status.log
+if sudo test -e "${new_state}/disk-health.log" \
+   && ! sudo test -e "${new_state}/disk-status.log"; then
+  sudo mv "${new_state}/disk-health.log" "${new_state}/disk-status.log"
 fi
 
-sudo install -Dm755 "${repo_dir}/bin/disk-status" /usr/local/bin/disk-status
-sudo install -Dm755 "${repo_dir}/bin/disk-status-collect" /usr/local/bin/disk-status-collect
-sudo install -Dm755 "${repo_dir}/bin/disk-status-notify" /usr/local/bin/disk-status-notify
+sudo install -Dm755 "${repo_dir}/bin/disk-status" "${local_bin_dir}/disk-status"
+sudo install -Dm755 "${repo_dir}/bin/disk-status-collect" "${local_bin_dir}/disk-status-collect"
+sudo install -Dm755 "${repo_dir}/bin/disk-status-notify" "${local_bin_dir}/disk-status-notify"
 
 for unit in "${repo_dir}"/systemd/system/*; do
-  sudo install -Dm644 "${unit}" "/etc/systemd/system/$(basename "${unit}")"
+  sudo install -Dm644 "${unit}" "${system_unit_dir}/$(basename "${unit}")"
 done
-sudo install -Dm644 "${repo_dir}/udev/99-disk-status.rules" /etc/udev/rules.d/99-disk-status.rules
+sudo install -Dm644 "${repo_dir}/udev/99-disk-status.rules" "${udev_rules_dir}/99-disk-status.rules"
 
 install -d -m 0755 "${target_home}/.config/systemd/user"
 for unit in "${repo_dir}"/systemd/user/*; do
@@ -92,14 +127,14 @@ done
 
 # Remove only the exact legacy artifacts superseded above. State/configuration
 # were moved first, so history and user customizations survive the rename.
-sudo rm -f /usr/local/bin/disk-health /usr/local/bin/disk-health-collect /usr/local/bin/disk-health-notify
-sudo rm -f /etc/systemd/system/disk-health-collect.service \
-  /etc/systemd/system/disk-health-collect.timer \
-  /etc/systemd/system/disk-health-collect.path \
-  /etc/systemd/user/disk-health-notify.service \
-  /etc/systemd/user/disk-health-notify.path \
-  /etc/systemd/user/disk-health-notify.timer \
-  /etc/udev/rules.d/99-disk-health.rules
+sudo rm -f "${local_bin_dir}/disk-health" "${local_bin_dir}/disk-health-collect" "${local_bin_dir}/disk-health-notify"
+sudo rm -f "${system_unit_dir}/disk-health-collect.service" \
+  "${system_unit_dir}/disk-health-collect.timer" \
+  "${system_unit_dir}/disk-health-collect.path" \
+  "${global_user_unit_dir}/disk-health-notify.service" \
+  "${global_user_unit_dir}/disk-health-notify.path" \
+  "${global_user_unit_dir}/disk-health-notify.timer" \
+  "${udev_rules_dir}/99-disk-health.rules"
 rm -f "${target_home}/.config/systemd/user/disk-health-notify.service" \
   "${target_home}/.config/systemd/user/disk-health-notify.path" \
   "${target_home}/.config/systemd/user/disk-health-notify.timer"
@@ -117,6 +152,6 @@ systemctl --user enable --now disk-status-notify.path disk-status-notify.timer
 
 echo
 echo "Disk Status backend installed."
-echo "State:  /var/lib/disk-status/disk-status.json"
+echo "State:  ${new_state}/disk-status.json"
 echo "Config: ${target_home}/.config/omarchy/disk-status.toml"
 echo "Check:  disk-status status"

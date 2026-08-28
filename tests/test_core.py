@@ -2,10 +2,12 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import pathlib
+import subprocess
 import tarfile
 import tempfile
 import types
 import unittest
+from datetime import datetime
 from unittest import mock
 
 
@@ -71,9 +73,17 @@ class CoreTests(unittest.TestCase):
         self.assertIn("1000", rendered)
 
     def test_bundle_manifest_lists_actual_members(self):
-        state = {"collected_at": "2026-01-01T00:00:00Z", "drives": [],
+        serial = "PRIVATE-SERIAL"
+        state = {"collected_at": "2026-01-01T00:00:00Z",
+                 "drives": [{"serial": serial, "history_id": serial,
+                             "model": "Example Model"}],
                  "removable": [], "events": []}
         with tempfile.TemporaryDirectory() as temp_dir:
+            history_dir = pathlib.Path(temp_dir) / "history"
+            history_dir.mkdir()
+            (history_dir / f"{serial}.csv").write_text(
+                "ts,temp_c\n2026-01-01T00:00:00Z,40\n", encoding="utf-8"
+            )
             old_state_dir = cli.STATE_DIR
             cli.STATE_DIR = temp_dir
             try:
@@ -84,7 +94,12 @@ class CoreTests(unittest.TestCase):
             with tarfile.open(bundle) as archive:
                 names = set(archive.getnames())
                 manifest = json.load(archive.extractfile("manifest.json"))
+                history_names = [name for name in names if name.startswith("history/")]
+                history_content = archive.extractfile(history_names[0]).read().decode()
         self.assertEqual(set(manifest["contents"]), names - {"manifest.json"})
+        self.assertEqual(len(history_names), 1)
+        self.assertNotIn(serial, history_names[0])
+        self.assertNotIn(serial, history_content)
 
     def test_notification_body_is_markup_escaped(self):
         result = types.SimpleNamespace(returncode=0)
@@ -93,12 +108,39 @@ class CoreTests(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertEqual(argv[-1], "&lt;b&gt;bad &amp; unsafe&lt;/b&gt;")
 
+    def test_seen_event_is_not_notified_again_after_migration(self):
+        state = {
+            "collected_at": datetime.now().astimezone().isoformat(),
+            "config": {"thresholds": {"stale_minutes": 45}},
+            "events": [{"id": "event-a", "kind": "warning", "to": "caution",
+                        "message": "already delivered"}],
+            "drives": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = pathlib.Path(temp_dir) / "disk-status.json"
+            seen_file = pathlib.Path(temp_dir) / "seen-events"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            seen_file.write_text("event-a\n", encoding="utf-8")
+            with mock.patch.object(notifier, "STATE_FILE", str(state_file)), \
+                 mock.patch.object(notifier, "SEEN_FILE", str(seen_file)), \
+                 mock.patch.object(notifier, "notify") as notify, \
+                 mock.patch.object(notifier.sys, "argv", ["disk-status-notify"]):
+                self.assertEqual(notifier.main(), 0)
+        notify.assert_not_called()
+
     def test_segmented_ring_is_full_only_at_true_100_percent(self):
-        source = (ROOT / "RadialGauge.qml").read_text(encoding="utf-8")
-        self.assertIn(
-            "fraction >= 1 ? root.segments : Math.floor(fraction * root.segments)",
-            source,
+        source = (ROOT / "GaugeMath.js").read_text(encoding="utf-8")
+        executable = source.replace(".pragma library", "") + """
+console.log(JSON.stringify([
+  litSegments(99.9, 42), litSegments(100, 42),
+  litSegments(-1, 42), litSegments(101, 42)
+]));
+"""
+        result = subprocess.run(
+            ["node", "-e", executable], check=True, text=True,
+            capture_output=True,
         )
+        self.assertEqual(json.loads(result.stdout), [41, 42, 0, 42])
 
 
 if __name__ == "__main__":

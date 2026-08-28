@@ -1,4 +1,5 @@
 import QtQuick
+import "GaugeMath.js" as GaugeMath
 
 Item {
   id: root
@@ -58,7 +59,7 @@ Item {
       var gap = Math.min(3.2, root.sweepDegrees / root.segments * 0.30)
       var step = root.sweepDegrees / root.segments
       // A completely lit segmented ring is reserved for a true 100%.
-      var lit = fraction >= 1 ? root.segments : Math.floor(fraction * root.segments)
+      var lit = GaugeMath.litSegments(root.value, root.segments)
       ctx.lineWidth = root.ringWidth; ctx.lineCap = "butt"
       for (var i = 0; i < root.segments; i++) {
         ctx.beginPath()
