@@ -1,0 +1,9 @@
+[Unit]
+Description=Notify when disk-status.json changes
+
+[Path]
+PathChanged=/var/lib/disk-status/disk-status.json
+Unit=disk-status-notify.service
+
+[Install]
+WantedBy=default.target

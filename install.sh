@@ -30,40 +30,73 @@ if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) e
   exit 1
 fi
 
-sudo install -Dm755 "${repo_dir}/bin/disk-health" /usr/local/bin/disk-health
-sudo install -Dm755 "${repo_dir}/bin/disk-health-collect" /usr/local/bin/disk-health-collect
-sudo install -Dm755 "${repo_dir}/bin/disk-health-notify" /usr/local/bin/disk-health-notify
+# Stop legacy units before moving their state. Missing units are expected on a
+# clean install; these commands intentionally remain best-effort.
+sudo systemctl disable --now disk-health-collect.service disk-health-collect.timer disk-health-collect.path 2>/dev/null || true
+systemctl --user disable --now disk-health-notify.service disk-health-notify.path disk-health-notify.timer 2>/dev/null || true
+
+install -d -m 0755 "${target_home}/.config/omarchy"
+if [[ -e "${target_home}/.config/omarchy/disk-health.toml" \
+      && ! -e "${target_home}/.config/omarchy/disk-status.toml" ]]; then
+  mv "${target_home}/.config/omarchy/disk-health.toml" \
+    "${target_home}/.config/omarchy/disk-status.toml"
+fi
+if [[ ! -e "${target_home}/.config/omarchy/disk-status.toml" ]]; then
+  install -m644 "${repo_dir}/config/disk-status.toml.example" \
+    "${target_home}/.config/omarchy/disk-status.toml"
+fi
+
+if sudo test -d /var/lib/disk-health && ! sudo test -e /var/lib/disk-status; then
+  sudo mv /var/lib/disk-health /var/lib/disk-status
+fi
+sudo install -d -m 0750 -o "${target_user}" -g "${target_group}" /var/lib/disk-status
+if sudo test -e /var/lib/disk-status/disk-health.json \
+   && ! sudo test -e /var/lib/disk-status/disk-status.json; then
+  sudo mv /var/lib/disk-status/disk-health.json /var/lib/disk-status/disk-status.json
+fi
+if sudo test -e /var/lib/disk-status/disk-health.log \
+   && ! sudo test -e /var/lib/disk-status/disk-status.log; then
+  sudo mv /var/lib/disk-status/disk-health.log /var/lib/disk-status/disk-status.log
+fi
+
+sudo install -Dm755 "${repo_dir}/bin/disk-status" /usr/local/bin/disk-status
+sudo install -Dm755 "${repo_dir}/bin/disk-status-collect" /usr/local/bin/disk-status-collect
+sudo install -Dm755 "${repo_dir}/bin/disk-status-notify" /usr/local/bin/disk-status-notify
 
 for unit in "${repo_dir}"/systemd/system/*; do
   sudo install -Dm644 "${unit}" "/etc/systemd/system/$(basename "${unit}")"
 done
-sudo install -Dm644 "${repo_dir}/udev/99-disk-health.rules" /etc/udev/rules.d/99-disk-health.rules
+sudo install -Dm644 "${repo_dir}/udev/99-disk-status.rules" /etc/udev/rules.d/99-disk-status.rules
 
 install -d -m 0755 "${target_home}/.config/systemd/user"
 for unit in "${repo_dir}"/systemd/user/*; do
   install -m644 "${unit}" "${target_home}/.config/systemd/user/$(basename "${unit}")"
 done
 
-install -d -m 0755 "${target_home}/.config/omarchy"
-if [[ ! -e "${target_home}/.config/omarchy/disk-health.toml" ]]; then
-  install -m644 "${repo_dir}/config/disk-health.toml.example" \
-    "${target_home}/.config/omarchy/disk-health.toml"
-fi
+# Remove only the exact legacy artifacts superseded above. State/configuration
+# were moved first, so history and user customizations survive the rename.
+sudo rm -f /usr/local/bin/disk-health /usr/local/bin/disk-health-collect /usr/local/bin/disk-health-notify
+sudo rm -f /etc/systemd/system/disk-health-collect.service \
+  /etc/systemd/system/disk-health-collect.timer \
+  /etc/systemd/system/disk-health-collect.path \
+  /etc/udev/rules.d/99-disk-health.rules
+rm -f "${target_home}/.config/systemd/user/disk-health-notify.service" \
+  "${target_home}/.config/systemd/user/disk-health-notify.path" \
+  "${target_home}/.config/systemd/user/disk-health-notify.timer"
 
-sudo install -d -m 0750 -o "${target_user}" -g "${target_group}" /var/lib/disk-health
 sudo systemctl daemon-reload
 sudo udevadm control --reload-rules
-sudo systemctl enable --now disk-health-collect.timer disk-health-collect.path
-sudo systemctl start disk-health-collect.service
+sudo systemctl enable --now disk-status-collect.timer disk-status-collect.path
+sudo systemctl start disk-status-collect.service
 
 if ! systemctl --user daemon-reload; then
   echo "Could not reach the systemd user session. Run the installer from your logged-in Omarchy desktop session." >&2
   exit 1
 fi
-systemctl --user enable --now disk-health-notify.path disk-health-notify.timer
+systemctl --user enable --now disk-status-notify.path disk-status-notify.timer
 
 echo
 echo "Disk Status backend installed."
-echo "State:  /var/lib/disk-health/disk-health.json"
-echo "Config: ${target_home}/.config/omarchy/disk-health.toml"
-echo "Check:  disk-health status"
+echo "State:  /var/lib/disk-status/disk-status.json"
+echo "Config: ${target_home}/.config/omarchy/disk-status.toml"
+echo "Check:  disk-status status"

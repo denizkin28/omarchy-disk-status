@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""disk-health — read the collector's state. Unprivileged by design.
+"""disk-status — read the collector's state. Unprivileged by design.
 
-Everything here reads /var/lib/disk-health/. Nothing runs smartctl, needs root,
+Everything here reads /var/lib/disk-status/. Nothing runs smartctl, needs root,
 starts a test, or changes a drive.
 
-  disk-health status [--full]      one line per drive, or the full cards
-  disk-health drives               terse serial/name/device mapping
-  disk-health io [--watch]         live read/write throughput per drive
-  disk-health history <serial>     the recorded time series
-  disk-health events [-n N]        recent state transitions
-  disk-health report [--text|--json] [-o FILE]
-  disk-health report --bundle FILE [--redact]
+  disk-status status [--full]      one line per drive, or the full cards
+  disk-status drives               terse serial/name/device mapping
+  disk-status io [--watch]         live read/write throughput per drive
+  disk-status history <serial>     the recorded time series
+  disk-status events [-n N]        recent state transitions
+  disk-status report [--text|--json] [-o FILE]
+  disk-status report --bundle FILE [--redact]
 """
 
 import argparse
@@ -25,8 +25,8 @@ import tarfile
 import time
 from datetime import datetime
 
-STATE_DIR = os.environ.get("DISK_HEALTH_STATE", "/var/lib/disk-health")
-STATE_FILE = os.path.join(STATE_DIR, "disk-health.json")
+STATE_DIR = os.environ.get("DISK_STATUS_STATE", "/var/lib/disk-status")
+STATE_FILE = os.path.join(STATE_DIR, "disk-status.json")
 
 GLYPH = {"good": "🟢", "caution": "⚠️ ", "bad": "🔴", "unknown": "❔"}
 COLOR = {"good": "\033[32m", "caution": "\033[33m", "bad": "\033[31m", "unknown": "\033[90m"}
@@ -47,13 +47,13 @@ def load_state():
             return json.load(fh)
     except FileNotFoundError:
         die(f"no state file at {STATE_FILE}\n"
-            f"Has the collector run? Try: sudo systemctl start disk-health-collect")
+            f"Has the collector run? Try: sudo systemctl start disk-status-collect")
     except ValueError as exc:
         die(f"state file is not valid JSON ({exc}) — the collector may be mid-write; retry")
 
 
 def die(msg, code=1):
-    print(f"disk-health: {msg}", file=sys.stderr)
+    print(f"disk-status: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -404,7 +404,7 @@ def cmd_io(args):
             time.sleep(args.interval)
             prev, rows = sample(prev, args.interval)
             sys.stdout.write("\033[H\033[J" if USE_COLOR else "\n")
-            print(c(f"disk-health io    {datetime.now().strftime('%H:%M:%S')}", BOLD))
+            print(c(f"disk-status io    {datetime.now().strftime('%H:%M:%S')}", BOLD))
             print()
             render(rows)
     except KeyboardInterrupt:
@@ -441,7 +441,7 @@ def cmd_history(args):
                         drive.get("disk_serial"), drive.get("identity_wwn")) if value)), None)
     history_id = matched.get("history_id") if matched else requested
     if os.path.basename(history_id) != history_id or history_id in ("", ".", ".."):
-        die("history identity must be a drive serial, WWN, or history_id from `disk-health drives`")
+        die("history identity must be a drive serial, WWN, or history_id from `disk-status drives`")
     path = os.path.join(STATE_DIR, "history", f"{history_id}.csv")
     if not os.path.exists(path):
         available = sorted(f[:-4] for f in os.listdir(os.path.join(STATE_DIR, "history"))
@@ -529,7 +529,7 @@ def create_support_bundle(path, state, redact=False):
         name = mapping.get(str(drive.get("serial")), history_id) if redact else history_id
         history_entries.append((f"history/{name}.csv", content))
 
-    manifest = {"format": "omarchy-disk-health-support-v1",
+    manifest = {"format": "omarchy-disk-status-support-v1",
                 "created_from": payload.get("collected_at"),
                 "redacted": bool(redact),
                 "contents": ["report.json", "README.txt"]
@@ -568,7 +568,7 @@ def cmd_report(args):
         buf = _io.StringIO()
         stdout, sys.stdout = sys.stdout, buf
         try:
-            print(f"disk-health report — {state['host']} — {state['collected_at']}")
+            print(f"disk-status report — {state['host']} — {state['collected_at']}")
             print(f"overall: {state['overall']['verdict']}\n")
             for drive in state["drives"]:
                 print_card(drive, state)
@@ -587,7 +587,7 @@ def cmd_report(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="disk-health", description=__doc__,
+    ap = argparse.ArgumentParser(prog="disk-status", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
 

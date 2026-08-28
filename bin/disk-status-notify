@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""disk-health-notify — turn collector events into desktop notifications.
+"""disk-status-notify — turn collector events into desktop notifications.
 
 Runs as the USER, not root: notify-send needs a session bus, and the collector
 (which is root) has none. Triggered by a systemd user path unit when
-disk-health.json changes, with a slow timer as a safety net.
+disk-status.json changes, with a slow timer as a safety net.
 
 Two rules it exists to enforce:
 
@@ -22,10 +22,10 @@ import subprocess
 import sys
 from datetime import datetime
 
-STATE_DIR = os.environ.get("DISK_HEALTH_STATE", "/var/lib/disk-health")
-STATE_FILE = os.path.join(STATE_DIR, "disk-health.json")
+STATE_DIR = os.environ.get("DISK_STATUS_STATE", "/var/lib/disk-status")
+STATE_FILE = os.path.join(STATE_DIR, "disk-status.json")
 SEEN_DIR = os.path.join(os.environ.get("XDG_STATE_HOME",
-                                       os.path.expanduser("~/.local/state")), "disk-health")
+                                       os.path.expanduser("~/.local/state")), "disk-status")
 SEEN_FILE = os.path.join(SEEN_DIR, "seen-events")
 SEEN_CAP = 500
 
@@ -102,10 +102,10 @@ def main():
             if dry:
                 print(f"[dry-run] STALE: {age:.0f} min old")
             else:
-                delivered = notify("❔ Disk health: no fresh data",
+                delivered = notify("❔ Disk Status: no fresh data",
                                    f"The collector has not run for {age:.0f} minutes.\n"
                                    f"Drive health is UNKNOWN, not good.\n"
-                                   f"Check: systemctl status disk-health-collect.timer",
+                                   f"Check: systemctl status disk-status-collect.timer",
                                    urgency="critical", icon=ICON["unknown"])
             if dry or delivered:
                 seen.append(stale_id)

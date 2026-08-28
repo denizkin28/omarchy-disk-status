@@ -2,21 +2,21 @@
 
 ## Privilege boundary
 
-Only `disk-health-collect` runs as root because SMART access normally requires it. The QML plugin, CLI, and notifier are unprivileged readers of one state directory. The systemd service uses filesystem, namespace, and kernel hardening directives and can write only to `/var/lib/disk-health`.
+Only `disk-status-collect` runs as root because SMART access normally requires it. The QML plugin, CLI, and notifier are unprivileged readers of one state directory. The systemd service uses filesystem, namespace, and kernel hardening directives and can write only to `/var/lib/disk-status`.
 
 ## Local data
 
-The state file contains hardware identifiers, drive models, mount points, filesystem usage, and optional user notes. Treat `/var/lib/disk-health` and support bundles as private system information.
+The state file contains hardware identifiers, drive models, mount points, filesystem usage, and optional user notes. Treat `/var/lib/disk-status` and support bundles as private system information.
 
 Before attaching diagnostics to an issue, generate a redacted bundle:
 
 ```bash
-disk-health report --bundle disk-status-support.tar.gz --redact
+disk-status report --bundle disk-status-support.tar.gz --redact
 ```
 
 Redaction retains drive models and capacity/usage figures for diagnosis. It removes hostnames, serials, WWNs, device and mount paths, notes, and identity-bearing event details.
 
-Never publish `disk-health.json`, `baselines.json`, raw SMART dumps, or an unredacted support bundle.
+Never publish `disk-status.json`, `baselines.json`, raw SMART dumps, or an unredacted support bundle.
 
 ## Reporting a vulnerability
 

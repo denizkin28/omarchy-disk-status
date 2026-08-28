@@ -10,7 +10,7 @@ import "PanelModel.js" as Present
 
 Panel {
   id: root
-  moduleName: "denizkin.disk-health"
+  moduleName: "denizkin.disk-status"
 
   property var anchorItem: null
   property var hostWidget: null
@@ -30,7 +30,7 @@ Panel {
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color bg: bar ? bar.background : Color.background
   readonly property string uiFont: bar ? bar.fontFamily : Style.font.family
-  readonly property color frameColor: Color.flatColor(Color.pick("disk-health.frame", "accent"), Color.accent)
+  readonly property color frameColor: Color.flatColor(Color.pick("disk-status.frame", "accent"), Color.accent)
   readonly property var overallDrive: stale ? null : Model.overallDrive(healthState)
   readonly property int overallScore: root.overallDrive ? root.healthValue(root.overallDrive) : -1
   readonly property string overallVerdict: root.overallDrive ? root.verdictFor(root.overallDrive) : "unknown"
@@ -41,7 +41,7 @@ Panel {
   readonly property int troubledCount: stale ? 0 : Model.troubledCount(healthState)
 
   function keyFor(d) { return String(d.serial || d.history_id || d.device || "") }
-  function verdictColor(v) { return Color.flatColor(Color.pick("disk-health." + v, Model.colorRole(v)), Color.foreground) }
+  function verdictColor(v) { return Color.flatColor(Color.pick("disk-status." + v, Model.colorRole(v)), Color.foreground) }
   function verdictFor(d) { return stale ? "unknown" : String((d.health || {}).verdict || "unknown") }
   function tintFor(d) { return verdictColor(verdictFor(d)) }
   function verdictLabel(d) { return stale ? "STALE" : Model.verdictWord(verdictFor(d)) }
@@ -108,7 +108,7 @@ Panel {
   function switchPanel(direction) { return bar && typeof bar.switchPanelFrom === "function" ? bar.switchPanelFrom(barIdentity, direction) : false }
 
   IpcHandler {
-    target: "denizkin.disk-health"
+    target: "denizkin.disk-status"
     function showPopup(): string { root.unpin(); root.open(); return "ok" }
     function hidePopup(): string { root.close(); return "ok" }
     function showSidebar(): string { root.pin(); return "ok" }
@@ -444,7 +444,7 @@ Panel {
       bottom: Style.gapsOut
       right: Style.gapsOut
     }
-    WlrLayershell.namespace: "denizkin-disk-health-pinned"
+    WlrLayershell.namespace: "denizkin-disk-status-pinned"
     WlrLayershell.layer: WlrLayer.Top
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
 

@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "denizkin.disk-health",
+  "id": "denizkin.disk-status",
   "name": "Disk Status",
   "version": "1.10.0",
   "author": "Denis",
-  "description": "Disk health, capacity, temperature and live I/O at a glance",
+  "description": "SMART status, capacity, temperature and live I/O at a glance",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Disk Status",
-    "description": "Disk health, capacity, temperature and live I/O at a glance",
+    "description": "SMART status, capacity, temperature and live I/O at a glance",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

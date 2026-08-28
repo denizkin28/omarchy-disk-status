@@ -1,5 +1,5 @@
 [Unit]
-Description=Safety net for the disk-health notifier
+Description=Safety net for the Disk Status notifier
 
 [Timer]
 # The path unit is the fast path. This exists because a missed inotify event

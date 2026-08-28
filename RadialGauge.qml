@@ -6,12 +6,14 @@ Item {
   property int segments: 36
   property real startDegrees: -225
   property real sweepDegrees: 270
-  property color activeColor: "#9bd67d"
-  property color trackColor: "#243023"
+  // Callers must supply semantic theme colors; transparent defaults prevent
+  // a future gauge from silently introducing a fixed-theme color.
+  property color activeColor: "transparent"
+  property color trackColor: "transparent"
   property real ringWidth: Math.max(5, width * 0.105)
   property string valueText: "" // Live call sites supply an explicit label.
   property string caption: ""
-  property color textColor: "#eef0d0"
+  property color textColor: "transparent"
   property string fontFamily: "monospace"
   property real valuePixelSize: width * 0.23
   property real captionPixelSize: width * 0.075

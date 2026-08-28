@@ -270,6 +270,6 @@ function copyText(drive, state) {
     }
   }
   L.push("", "collected " + (state && state.collected_at ? state.collected_at : "?")
-    + " by omarchy-disk-health on " + (state && state.host ? state.host : "?"))
+    + " by omarchy-disk-status on " + (state && state.host ? state.host : "?"))
   return L.join("\n")
 }

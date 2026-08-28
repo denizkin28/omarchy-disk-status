@@ -6,8 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Do not paste raw SMART output or `disk-health.json`. Create a redacted bundle with:
-        `disk-health report --bundle disk-status-support.tar.gz --redact`
+        Do not paste raw SMART output or `disk-status.json`. Create a redacted bundle with:
+        `disk-status report --bundle disk-status-support.tar.gz --redact`
   - type: textarea
     id: problem
     attributes:

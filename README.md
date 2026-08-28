@@ -1,6 +1,6 @@
 # Omarchy Disk Status
 
-Disk health, capacity, temperature, removable-drive state, and live I/O in one lightweight Omarchy dashboard.
+SMART status, capacity, temperature, removable-drive state, and live I/O in one lightweight Omarchy dashboard.
 
 ![Disk Status popup dashboard](assets/screenshots/popup-dashboard.png)
 
@@ -55,21 +55,23 @@ omarchy plugin add https://github.com/denizkin28/omarchy-disk-status --enable
 Then install the collector and notification services from the cloned plugin:
 
 ```bash
-~/.config/omarchy/plugins/denizkin.disk-health/install.sh
+~/.config/omarchy/plugins/denizkin.disk-status/install.sh
 ```
 
 The installer adds the collector, CLI, notifier, hardened systemd units, and udev integration; preserves existing history; creates a configuration only when one does not exist; and performs the first collection.
 
+Preview builds that used the former internal name are migrated automatically: configuration, state, and history move to the Disk Status paths before the obsolete services are removed.
+
 Verify the result:
 
 ```bash
-disk-health status
-systemctl status disk-health-collect.timer
+disk-status status
+systemctl status disk-status-collect.timer
 ```
 
 ## Configuration
 
-The optional configuration file is `~/.config/omarchy/disk-health.toml`. Use it for friendly drive names and notes, rated SSD endurance, classification overrides, ignored devices, and thresholds.
+The optional configuration file is `~/.config/omarchy/disk-status.toml`. Use it for friendly drive names and notes, rated SSD endurance, classification overrides, ignored devices, and thresholds.
 
 ```toml
 [names]
@@ -87,10 +89,10 @@ io_show_mbps   = 10
 stale_minutes  = 45
 ```
 
-The complete template is at [`config/disk-health.toml.example`](config/disk-health.toml.example). Apply changes with:
+The complete template is at [`config/disk-status.toml.example`](config/disk-status.toml.example). Apply changes with:
 
 ```bash
-sudo systemctl start disk-health-collect.service
+sudo systemctl start disk-status-collect.service
 ```
 
 ## Popup and pinned modes
@@ -98,11 +100,11 @@ sudo systemctl start disk-health-collect.service
 Click the bar icon to open the popup. Use **PIN** for a right-side layer-shell window that reserves workspace space. Pinned mode uses one card per row; the popup uses two columns where space allows.
 
 ```bash
-omarchy-shell denizkin.disk-health showPopup
-omarchy-shell denizkin.disk-health hidePopup
-omarchy-shell denizkin.disk-health showSidebar
-omarchy-shell denizkin.disk-health hideSidebar
-omarchy-shell denizkin.disk-health toggleSidebar
+omarchy-shell denizkin.disk-status showPopup
+omarchy-shell denizkin.disk-status hidePopup
+omarchy-shell denizkin.disk-status showSidebar
+omarchy-shell denizkin.disk-status hideSidebar
+omarchy-shell denizkin.disk-status toggleSidebar
 ```
 
 ## CLI
@@ -110,18 +112,18 @@ omarchy-shell denizkin.disk-health toggleSidebar
 The unprivileged CLI reads the same state as the QML interface and never runs SMART commands itself:
 
 ```bash
-disk-health status --full
-disk-health drives
-disk-health io --watch
-disk-health history SERIAL
-disk-health events -n 20
+disk-status status --full
+disk-status drives
+disk-status io --watch
+disk-status history SERIAL
+disk-status events -n 20
 ```
 
 Before sharing diagnostics, always redact them:
 
 ```bash
-disk-health report --bundle disk-status-support.tar.gz --redact
-disk-health report --json --redact --output report.json
+disk-status report --bundle disk-status-support.tar.gz --redact
+disk-status report --json --redact --output report.json
 ```
 
 Redaction keeps drive models and capacity/usage figures because they are useful for diagnosis. It removes hostnames, serials, WWNs, device and mount paths, notes, and identity-bearing event details.
@@ -134,12 +136,12 @@ If installation cannot reach `systemctl --user`, run it from a terminal inside y
 smartctl + lsblk
        │
        ▼
-disk-health-collect  (root, every 30 minutes or on device change)
+disk-status-collect  (root, every 30 minutes or on device change)
        │ atomic write
        ▼
-/var/lib/disk-health/disk-health.json
+/var/lib/disk-status/disk-status.json
        ├── QML bar + dashboard  (unprivileged)
-       ├── disk-health CLI      (unprivileged)
+       ├── disk-status CLI      (unprivileged)
        └── desktop notifier     (user service)
 ```
 
@@ -164,12 +166,8 @@ Collector state can contain serials, WWNs, models, mount paths, filesystem usage
 ```bash
 omarchy plugin validate .
 qmllint Panel.qml BarWidget.qml RadialGauge.qml
-python -m py_compile bin/disk-health bin/disk-health-collect bin/disk-health-notify
+python -m py_compile bin/disk-status bin/disk-status-collect bin/disk-status-notify
 bash -n install.sh
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). The project is licensed under the [MIT License](LICENSE).
-
-## Compatibility note
-
-The product and repository are named **Disk Status**. The internal ID remains `denizkin.disk-health`, and historical command/state names remain `disk-health`, so existing placement, configuration, history, IPC automation, and upgrades continue to work.

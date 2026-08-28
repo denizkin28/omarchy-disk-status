@@ -1,12 +1,12 @@
 [Unit]
-Description=Collect SMART state into disk-health.json
+Description=Collect SMART state into disk-status.json
 Documentation=man:smartd(8)
 After=smartd.service
 Wants=smartd.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/disk-health-collect
+ExecStart=/usr/local/bin/disk-status-collect
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=300
@@ -14,7 +14,7 @@ TimeoutStartSec=300
 # Root is needed for smartctl, but nothing else. Everything this writes lives
 # under the state dir; the rest of the filesystem is read-only to it.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/disk-health
+ReadWritePaths=/var/lib/disk-status
 ProtectHome=read-only
 PrivateTmp=true
 NoNewPrivileges=true

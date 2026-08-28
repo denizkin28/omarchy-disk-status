@@ -7,11 +7,11 @@ Before submitting a change:
 ```bash
 omarchy plugin validate .
 qmllint Panel.qml BarWidget.qml RadialGauge.qml
-python -m py_compile bin/disk-health bin/disk-health-collect bin/disk-health-notify
+python -m py_compile bin/disk-status bin/disk-status-collect bin/disk-status-notify
 bash -n install.sh
 ```
 
-Do not commit real collector state, SMART dumps, disk serials, WWNs, hostnames, mount paths, or personal notes. Use `disk-health report --redact` when preparing fixtures or bug reports.
+Do not commit real collector state, SMART dumps, disk serials, WWNs, hostnames, mount paths, or personal notes. Use `disk-status report --redact` when preparing fixtures or bug reports.
 
 Preserve these interface rules:
 

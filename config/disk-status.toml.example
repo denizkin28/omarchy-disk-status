@@ -1,5 +1,5 @@
 # Omarchy Disk Status collector configuration.
-# Copy to ~/.config/omarchy/disk-health.toml and customize as needed.
+# Copy to ~/.config/omarchy/disk-status.toml and customize as needed.
 
 [names]
 # "DRIVE_SERIAL" = "friendly name"

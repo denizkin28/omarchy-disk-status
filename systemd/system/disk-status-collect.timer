@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh disk-health.json every 30 minutes
+Description=Refresh disk-status.json every 30 minutes
 
 [Timer]
 # Offset from the hour so we land after smartd's own 30-minute cycle rather
@@ -7,7 +7,7 @@ Description=Refresh disk-health.json every 30 minutes
 OnCalendar=*:07/30
 Persistent=true
 AccuracySec=1min
-Unit=disk-health-collect.service
+Unit=disk-status-collect.service
 
 [Install]
 WantedBy=timers.target

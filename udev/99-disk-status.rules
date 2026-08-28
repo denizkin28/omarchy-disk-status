@@ -1,4 +1,4 @@
-# omarchy-disk-health — refresh the collector when a disk appears or disappears.
+# omarchy-disk-status — refresh the collector when a disk appears or disappears.
 #
 # Why udev and not smartd: smartd only learns about devices when it starts, so
 # it will never notice a drive plugged in afterwards. The collector reads the
@@ -13,15 +13,15 @@
 # RUN stalls device setup for everything behind it. `systemctl --no-block`
 # queues the job and returns.
 
-ACTION!="add|remove", GOTO="disk_health_end"
-SUBSYSTEM!="block", GOTO="disk_health_end"
-ENV{DEVTYPE}!="disk", GOTO="disk_health_end"
+ACTION!="add|remove", GOTO="disk_status_end"
+SUBSYSTEM!="block", GOTO="disk_status_end"
+ENV{DEVTYPE}!="disk", GOTO="disk_status_end"
 
 # Virtual and mapper devices are not drives and would fire this constantly.
-KERNEL=="loop*|zram*|dm-*|md*|ram*|sr*", GOTO="disk_health_end"
+KERNEL=="loop*|zram*|dm-*|md*|ram*|sr*", GOTO="disk_status_end"
 
 # Any real disk appearing or disappearing: re-collect.
-RUN+="/usr/bin/systemctl --no-block start disk-health-collect.service"
+RUN+="/usr/bin/systemctl --no-block start disk-status-collect.service"
 
 # Restarting smartd when a PERMANENT drive reconnects is deliberately NOT done
 # here. It would have to match ENV{ID_SERIAL_SHORT}, which is set by an
@@ -29,6 +29,6 @@ RUN+="/usr/bin/systemctl --no-block start disk-health-collect.service"
 # scope by the time a 99-* rule runs — `udevadm test` shows it absent. The
 # collector makes that decision instead: it has the previous state, so it knows
 # which drives are permanent and which have just come back, and it logs the
-# restart where you can see it. See restart_smartd() in bin/disk-health-collect.
+# restart where you can see it. See restart_smartd() in bin/disk-status-collect.
 
-LABEL="disk_health_end"
+LABEL="disk_status_end"

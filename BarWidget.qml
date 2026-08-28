@@ -8,15 +8,15 @@ import "DiskIoModel.js" as Io
 // Disk status in the bar: one harddisk glyph, tinted by the worst verdict
 // across the fixed drives, hosting the CrystalDiskInfo-style detail panel.
 //
-// This widget reads ONE file — /var/lib/disk-health/disk-health.json,
+// This widget reads ONE file — /var/lib/disk-status/disk-status.json,
 // written by the privileged collector. It never runs smartctl and never needs
 // root. If the file is missing or stale the glyph goes muted and says so:
 // unknown is not good.
 BarWidget {
   id: root
-  moduleName: "denizkin.disk-health"
+  moduleName: "denizkin.disk-status"
 
-  readonly property string statePath: setting("statePath", "/var/lib/disk-health/disk-health.json")
+  readonly property string statePath: setting("statePath", "/var/lib/disk-status/disk-status.json")
 
   property var healthState: null
   property bool loadFailed: false
@@ -72,12 +72,12 @@ BarWidget {
 
   // Colours come from theme ROLES, not hex, so every Omarchy theme works. A
   // user can override any of them in ~/.config/omarchy/shell.toml under
-  // [disk-health]; those keys survive theme switches.
+  // [disk-status]; those keys survive theme switches.
   // Color.pick() returns a raw STRING from shell.toml (or the fallback), so it
   // has to go through flatColor() to become a colour — that is also what
   // resolves a bare role name like "accent" against the current theme.
   readonly property color verdictColor: Color.flatColor(
-    Color.pick("disk-health." + verdict, Model.colorRole(verdict)),
+    Color.pick("disk-status." + verdict, Model.colorRole(verdict)),
     Color.foreground)
 
   function refresh() {

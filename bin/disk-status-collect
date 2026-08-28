@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""disk-health-collect — the privileged collector.
+"""disk-status-collect — the privileged collector.
 
 Reads SMART for every fixed drive with smartctl, decides a verdict against the
 accepted baseline, and writes ONE state file that every other component reads:
 
-    /var/lib/disk-health/disk-health.json
+    /var/lib/disk-status/disk-status.json
 
 Nothing else in this project parses SMART. The bar widget, the CLI and the
 notifier all read that JSON, so its schema is a contract — written out in
@@ -44,10 +44,10 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.0.0"
+COLLECTOR_VERSION = "1.10.0"
 SCHEMA = 1
 
-STATE_DIR = os.environ.get("DISK_HEALTH_STATE", "/var/lib/disk-health")
+STATE_DIR = os.environ.get("DISK_STATUS_STATE", "/var/lib/disk-status")
 LOG_WRITES_ENABLED = True
 
 # Error counters with useful, sufficiently common semantics. Compared against
@@ -181,7 +181,7 @@ def previous_drive_for(dev, path, previous):
 def log_line(text):
     if not LOG_WRITES_ENABLED:
         return
-    path = os.path.join(STATE_DIR, "disk-health.log")
+    path = os.path.join(STATE_DIR, "disk-status.log")
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"{datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z')}\t{text}\n")
@@ -219,16 +219,16 @@ def state_owner():
     Several candidates, because the state ROOT can legitimately be root-owned —
     it is often a pre-existing directory on a mirrored disk that install.sh was
     pointed at with --state, while the subdirectories it created are the user's.
-    DISK_HEALTH_OWNER overrides the lot.
+    DISK_STATUS_OWNER overrides the lot.
     """
-    named = os.environ.get("DISK_HEALTH_OWNER")
+    named = os.environ.get("DISK_STATUS_OWNER")
     if named:
         try:
             entry = pwd.getpwnam(named)
             return entry.pw_uid, entry.pw_gid
         except KeyError:
             pass
-    for candidate in ("history", "events", "", "disk-health.json"):
+    for candidate in ("history", "events", "", "disk-status.json"):
         try:
             st = os.stat(os.path.join(STATE_DIR, candidate))
         except OSError:
@@ -250,14 +250,14 @@ def chown_owner(path):
 
 
 def default_config_path():
-    """Where this install's disk-health.toml lives.
+    """Where this install's disk-status.toml lives.
 
     Root has no ~/.config/omarchy; the account that owns the state directory
     does, and that is the same account install.sh wrote the file for. The unit
     passes no --config, so getting this wrong means the config is read on no
-    machine but the author's. DISK_HEALTH_CONFIG overrides it.
+    machine but the author's. DISK_STATUS_CONFIG overrides it.
     """
-    env = os.environ.get("DISK_HEALTH_CONFIG")
+    env = os.environ.get("DISK_STATUS_CONFIG")
     if env:
         return env
     uid, _ = state_owner()
@@ -268,7 +268,7 @@ def default_config_path():
         except KeyError:
             home = None
     return os.path.join(home or os.path.expanduser("~"),
-                        ".config", "omarchy", "disk-health.toml")
+                        ".config", "omarchy", "disk-status.toml")
 
 
 def write_atomic(path, text, mode=0o644):
@@ -448,7 +448,7 @@ def is_sandbox_mount(path):
     """Is this "mount" an artefact of our own systemd sandbox?
 
     The collector unit runs ProtectSystem=strict with
-    ReadWritePaths=/var/lib/disk-health, and systemd implements that by
+    ReadWritePaths=/var/lib/disk-status, and systemd implements that by
     bind-mounting the resolved path read-write INSIDE the unit's namespace. So
     `lsblk`, run from in there, reports the state directory as a mount point
     that does not exist on the host — and the card then listed
@@ -1891,7 +1891,7 @@ def capture_baseline(drive, baselines, ts):
             counters[TRIPWIRES[a["id"]]] = a["raw"]
     drives[serial] = {
         "captured_at": ts,
-        "source": "captured by disk-health-collect on first successful read",
+        "source": "captured by disk-status-collect on first successful read",
         "poh": drive.get("power_on_hours"),
         "counters": counters,
         "disk_serial": drive.get("disk_serial"),
@@ -2137,10 +2137,10 @@ def drain_smartd_events(ts):
 
 def main():
     global LOG_WRITES_ENABLED
-    ap = argparse.ArgumentParser(description="Collect SMART state into disk-health.json")
+    ap = argparse.ArgumentParser(description="Collect SMART state into disk-status.json")
     ap.add_argument("--config", default=None,
-                    help="path to disk-health.toml (default: the state directory "
-                         "owner's ~/.config/omarchy/disk-health.toml)")
+                    help="path to disk-status.toml (default: the state directory "
+                         "owner's ~/.config/omarchy/disk-status.toml)")
     ap.add_argument("--dump-raw", metavar="DIR", help="also save each smartctl JSON here")
     ap.add_argument("--fixtures", metavar="DIR", help="read saved smartctl JSON instead of running it")
     ap.add_argument("--dry-run", action="store_true", help="print the state, write nothing")
@@ -2153,7 +2153,7 @@ def main():
     cfg = load_config(args.config or default_config_path())
     ignore = set(cfg["ignore"]["serials"])
 
-    state_path = os.path.join(STATE_DIR, "disk-health.json")
+    state_path = os.path.join(STATE_DIR, "disk-status.json")
     baselines_path = os.path.join(STATE_DIR, "baselines.json")
     prev_state = load_json_file(state_path, {})
     baselines = load_json_file(baselines_path, {"drives": {}})
@@ -2421,7 +2421,7 @@ def main():
     for serial in collector_errors:
         events.append(make_event(ts, serial, "collector_error", None, "unknown",
                                  f"{serial}: the collector failed to build this drive's "
-                                 f"record; see disk-health.log"))
+                                 f"record; see disk-status.log"))
     events += drain_smartd_events(ts)
     prev_events = prev_state.get("events") or []
     all_events = (prev_events + events)[-50:]
@@ -2429,7 +2429,7 @@ def main():
     state = {
         "schema": SCHEMA,
         "collected_at": ts,
-        "collector_version": VERSION,
+        "collector_version": COLLECTOR_VERSION,
         "host": socket.gethostname(),
         "duration_ms": int((time.time() - started) * 1000),
         "config": {"thresholds": cfg["thresholds"]},
