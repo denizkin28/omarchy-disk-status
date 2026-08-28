@@ -33,6 +33,7 @@ fi
 # Stop legacy units before moving their state. Missing units are expected on a
 # clean install; these commands intentionally remain best-effort.
 sudo systemctl disable --now disk-health-collect.service disk-health-collect.timer disk-health-collect.path 2>/dev/null || true
+sudo systemctl --global disable disk-health-notify.path disk-health-notify.timer 2>/dev/null || true
 systemctl --user disable --now disk-health-notify.service disk-health-notify.path disk-health-notify.timer 2>/dev/null || true
 
 install -d -m 0755 "${target_home}/.config/omarchy"
