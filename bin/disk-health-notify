@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""disk-health-notify — turn collector events into desktop notifications.
+
+Runs as the USER, not root: notify-send needs a session bus, and the collector
+(which is root) has none. Triggered by a systemd user path unit when
+disk-health.json changes, with a slow timer as a safety net.
+
+Two rules it exists to enforce:
+
+  * Every event is announced exactly ONCE. Seen ids are remembered on disk, so
+    the path unit and the timer can both fire, the file can be rewritten
+    unchanged, and the user still sees one toast.
+  * A collector that has STOPPED is reported. Silence from a monitoring tool is
+    indistinguishable from good news, which is the failure mode this whole
+    project exists to avoid.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+STATE_DIR = os.environ.get("DISK_HEALTH_STATE", "/var/lib/disk-health")
+STATE_FILE = os.path.join(STATE_DIR, "disk-health.json")
+SEEN_DIR = os.path.join(os.environ.get("XDG_STATE_HOME",
+                                       os.path.expanduser("~/.local/state")), "disk-health")
+SEEN_FILE = os.path.join(SEEN_DIR, "seen-events")
+SEEN_CAP = 500
+
+ICON = {"good": "drive-harddisk", "caution": "dialog-warning",
+        "bad": "dialog-error", "unknown": "dialog-question"}
+EMOJI = {"good": "🟢", "caution": "⚠️", "bad": "🔴", "unknown": "❔"}
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def save_seen(ids):
+    os.makedirs(SEEN_DIR, exist_ok=True)
+    tmp = SEEN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(ids[-SEEN_CAP:]) + "\n")
+    os.replace(tmp, SEEN_FILE)
+
+
+def notify(title, body, urgency="normal", icon="drive-harddisk"):
+    try:
+        proc = subprocess.run(["notify-send", "--app-name=disk-health",
+                               f"--urgency={urgency}", f"--icon={icon}",
+                               title, body], timeout=10, check=False)
+        if proc.returncode != 0:
+            print(f"notify-send failed with exit {proc.returncode}", file=sys.stderr)
+            return False
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"notify-send failed: {exc}", file=sys.stderr)
+        return False
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    # --dry-run alone changes nothing on disk, which means it cannot exercise
+    # the dedupe. --mark-seen makes it record what it would have sent, so a test
+    # can prove an event fires exactly once.
+    mark_seen = "--mark-seen" in sys.argv
+
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        return 0                      # nothing collected yet; not an error
+    except ValueError:
+        return 0                      # caught mid-write; the next trigger will do
+
+    seen_file_existed = os.path.exists(SEEN_FILE)
+    seen = load_seen()
+    seen_set = set(seen)
+    fired = 0
+
+    # --- the collector itself may have died -------------------------------- #
+    limit = state.get("config", {}).get("thresholds", {}).get("stale_minutes", 45)
+    try:
+        age = (datetime.now().astimezone()
+               - datetime.fromisoformat(state["collected_at"])).total_seconds() / 60
+    except (KeyError, ValueError):
+        age = None
+
+    # One id per stale *episode*, not per check, so a dead collector nags once
+    # rather than every five minutes. It re-arms once data is fresh again.
+    stale_id = f"stale-{state.get('collected_at','?')}"
+    if age is not None and age > limit * 2:
+        if stale_id not in seen_set:
+            if dry:
+                print(f"[dry-run] STALE: {age:.0f} min old")
+            else:
+                delivered = notify("❔ Disk health: no fresh data",
+                                   f"The collector has not run for {age:.0f} minutes.\n"
+                                   f"Drive health is UNKNOWN, not good.\n"
+                                   f"Check: systemctl status disk-health-collect.timer",
+                                   urgency="critical", icon=ICON["unknown"])
+            if dry or delivered:
+                seen.append(stale_id)
+                seen_set.add(stale_id)
+                fired += 1
+
+    # --- transition events -------------------------------------------------- #
+    events = state.get("events", [])
+    # Installing/reinstalling the notifier must not replay the retained event
+    # history as a toast storm. Adopt the current history once; only later
+    # transitions are notifications. Dry-run remains observational.
+    if not seen_file_existed and not dry:
+        adopted = [event.get("id") for event in events if event.get("id")]
+        if adopted:
+            seen.extend(adopted)
+            seen_set.update(adopted)
+        # The empty marker matters too: without it, a first event arriving
+        # after this clean startup would look like retained installation
+        # history and be silently adopted.
+        save_seen(seen)
+
+    for event in events:
+        eid = event.get("id")
+        if not eid or eid in seen_set:
+            continue
+        kind = event.get("kind", "")
+        to = event.get("to") or "unknown"
+        if kind == "recovery":
+            title = f"{EMOJI['good']} Disk recovered"
+            urgency, icon = "normal", ICON["good"]
+        elif kind in ("hotplug_add", "hotplug_remove"):
+            title = "🔌 Disk " + ("plugged in" if kind == "hotplug_add" else "removed")
+            urgency, icon = "low", ICON["good"]
+        elif to == "bad" or kind == "selftest_failed":
+            title = f"{EMOJI['bad']} Disk problem"
+            urgency, icon = "critical", ICON["bad"]
+        else:
+            title = f"{EMOJI['caution']} Disk warning"
+            urgency, icon = "normal", ICON["caution"]
+
+        if dry:
+            print(f"[dry-run] {urgency:8} {title}: {event.get('message','')[:110]}")
+            delivered = True
+        else:
+            delivered = notify(title, event.get("message", "")[:400], urgency=urgency, icon=icon)
+        if delivered:
+            seen.append(eid)
+            seen_set.add(eid)
+            fired += 1
+
+    # Unresolved bad/caution states are reminded on a diminishing cadence:
+    # after 1, 2, 4 and 7 days, then weekly. Each slot has a stable id, so the
+    # path unit and timer can race without producing duplicate notifications.
+    now = datetime.now().astimezone()
+    for drive in state.get("drives", []):
+        verdict = (drive.get("health") or {}).get("verdict")
+        if verdict not in ("bad", "caution"):
+            continue
+        serial = drive.get("serial")
+        onset = None
+        onset_text = drive.get("health_since")
+        if onset_text:
+            try:
+                onset = datetime.fromisoformat(onset_text)
+                if onset.tzinfo is None:
+                    onset = onset.astimezone()
+            except (ValueError, TypeError):
+                onset = None
+        for event in reversed(events) if onset is None else []:
+            if (event.get("serial") == serial and event.get("to") == verdict
+                    and event.get("kind") not in ("trend", "hotplug_add", "hotplug_remove")):
+                try:
+                    onset = datetime.fromisoformat(event["at"])
+                    if onset.tzinfo is None:
+                        onset = onset.astimezone()
+                except (KeyError, ValueError, TypeError):
+                    onset = None
+                break
+        if onset is None:
+            continue
+        age_days = max(0, int((now - onset).total_seconds() / 86400))
+        slot = age_days if age_days in (1, 2, 4, 7) else (
+            7 + ((age_days - 7) // 7) * 7 if age_days > 7 else None)
+        if slot is None:
+            continue
+        episode = onset.strftime("%Y%m%dT%H%M%S")
+        reminder_id = f"reminder-{serial}-{verdict}-{episode}-{slot}d"
+        if reminder_id in seen_set:
+            continue
+        reasons = "; ".join((drive.get("health") or {}).get("reasons") or [])
+        title = f"{EMOJI[verdict]} Disk problem still unresolved"
+        body = f"{drive.get('name', serial)} remains {verdict} after {age_days} day(s)."
+        if reasons:
+            body += "\n" + reasons[:300]
+        delivered = True if dry else notify(title, body,
+                                             urgency="critical" if verdict == "bad" else "normal",
+                                             icon=ICON[verdict])
+        if dry:
+            print(f"[dry-run] reminder {title}: {body[:110]}")
+        if delivered:
+            seen.append(reminder_id)
+            seen_set.add(reminder_id)
+            fired += 1
+
+    if fired and (not dry or mark_seen):
+        save_seen(seen)
+    if dry:
+        where = "recorded as seen" if mark_seen else "seen-list NOT written"
+        print(f"[dry-run] {fired} notification(s) would have fired; {where}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

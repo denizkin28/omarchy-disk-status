@@ -8,3 +8,5 @@ FABLE-CODE-REVIEW-PROMPT.md
 *.bak
 *~
 .cache/
+__pycache__/
+*.pyc

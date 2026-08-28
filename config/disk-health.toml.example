@@ -1,0 +1,34 @@
+# Omarchy Disk Status collector configuration.
+# Copy to ~/.config/omarchy/disk-health.toml and customize as needed.
+
+[names]
+# "DRIVE_SERIAL" = "friendly name"
+
+[notes]
+# "DRIVE_SERIAL" = "purpose or location"
+
+[kinds]
+# "DRIVE_SERIAL" = "HDD"
+
+[endurance]
+# Rated terabytes written for SSD endurance reporting.
+# "DRIVE_SERIAL" = 1200
+
+[thresholds]
+hdd_temp_warn  = 55
+ssd_temp_warn  = 70
+nvme_temp_warn = 70
+wear_warn_pct  = 20
+io_show_mbps   = 10
+stale_minutes  = 45
+
+[ignore]
+serials = []
+
+[fixed]
+# Force devices that auto-detection cannot classify correctly.
+serials = []
+
+[removable]
+# Removable devices never affect the overall system score.
+serials = []

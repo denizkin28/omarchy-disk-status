@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""disk-health — read the collector's state. Unprivileged by design.
+
+Everything here reads /var/lib/disk-health/. Nothing runs smartctl, needs root,
+starts a test, or changes a drive.
+
+  disk-health status [--full]      one line per drive, or the full cards
+  disk-health drives               terse serial/name/device mapping
+  disk-health io [--watch]         live read/write throughput per drive
+  disk-health history <serial>     the recorded time series
+  disk-health events [-n N]        recent state transitions
+  disk-health report [--text|--json] [-o FILE]
+  disk-health report --bundle FILE [--redact]
+"""
+
+import argparse
+import copy
+import hashlib
+import io
+import json
+import os
+import shutil
+import sys
+import tarfile
+import time
+from datetime import datetime
+
+STATE_DIR = os.environ.get("DISK_HEALTH_STATE", "/var/lib/disk-health")
+STATE_FILE = os.path.join(STATE_DIR, "disk-health.json")
+
+GLYPH = {"good": "🟢", "caution": "⚠️ ", "bad": "🔴", "unknown": "❔"}
+COLOR = {"good": "\033[32m", "caution": "\033[33m", "bad": "\033[31m", "unknown": "\033[90m"}
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(text, code):
+    return f"{code}{text}{RESET}" if USE_COLOR else str(text)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        die(f"no state file at {STATE_FILE}\n"
+            f"Has the collector run? Try: sudo systemctl start disk-health-collect")
+    except ValueError as exc:
+        die(f"state file is not valid JSON ({exc}) — the collector may be mid-write; retry")
+
+
+def die(msg, code=1):
+    print(f"disk-health: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def age_minutes(state):
+    try:
+        then = datetime.fromisoformat(state["collected_at"])
+    except (KeyError, ValueError):
+        return None
+    return (datetime.now().astimezone() - then).total_seconds() / 60
+
+
+def staleness_banner(state):
+    """A state file that stopped updating must never read as healthy. This is
+    the CLI half of the "unknown is never green" rule."""
+    age = age_minutes(state)
+    limit = state.get("config", {}).get("thresholds", {}).get("stale_minutes", 45)
+    if age is None:
+        return "state file has no usable timestamp — treat everything below as unknown"
+    if age > limit:
+        return (f"state is {age:.0f} minutes old (stale after {limit}) — "
+                f"the collector may have stopped. Everything below is UNKNOWN, not healthy.")
+    return None
+
+
+def human_bytes(n):
+    if not isinstance(n, (int, float)):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1000:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1000
+    return f"{n:.1f} EB"
+
+
+def counters_of(drive):
+    """The four that matter, as (value, delta-from-baseline) pairs."""
+    wanted = {5: "realloc", 197: "pending", 198: "uncorr", 199: "crc"}
+    out = {}
+    for attr in drive.get("attributes") or []:
+        if attr["id"] in wanted:
+            out[wanted[attr["id"]]] = (attr.get("raw"), attr.get("delta"))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# status
+# --------------------------------------------------------------------------- #
+
+def cmd_status(args):
+    state = load_state()
+    banner = staleness_banner(state)
+    if banner:
+        print(c(f"  {banner}", COLOR["caution"]))
+        print()
+
+    if args.full:
+        for drive in state["drives"]:
+            print_card(drive, state)
+        if state.get("removable"):
+            print(c("Removable", BOLD))
+            print(c("  never affects the overall verdict", DIM))
+            print()
+            for drive in state["removable"]:
+                print_card(drive, state)
+        return 0
+
+    overall = state["overall"]["verdict"]
+    age = age_minutes(state)
+    print(f"{GLYPH.get(overall,'❔')} {c(overall.upper(), COLOR.get(overall,''))}"
+          f"   {c(f'collected {age:.0f} min ago' if age is not None else 'no timestamp', DIM)}")
+    print()
+    header = f"    {'DRIVE':<15} {'HEALTH':>7}  {'TEMP':>5}  {'POH':>7}  {'REALLOC':>7} {'PEND':>5} {'UNCORR':>6} {'CRC':>4}  SOURCE"
+    print(c(header, DIM))
+    for drive in state["drives"] + state.get("removable", []):
+        print_row(drive)
+    events = [e for e in state.get("events", []) if e["kind"] in ("tripwire", "recovery", "selftest_failed")]
+    if events:
+        print()
+        print(c("Recent transitions", DIM))
+        for event in events[-3:]:
+            print(f"    {event['at'][:16].replace('T',' ')}  {event['message'][:96]}")
+    return 0
+
+
+def print_row(drive):
+    v = drive["health"]["verdict"]
+    cnt = counters_of(drive)
+
+    def cell(key, width):
+        if key not in cnt:
+            return f"{'—':>{width}}"
+        raw, delta = cnt[key]
+        text = str(raw)
+        if isinstance(delta, int) and delta > 0:
+            text = f"{raw}(+{delta})"
+            return c(f"{text:>{width}}", COLOR["bad"])
+        return f"{text:>{width}}"
+
+    pct = drive["health"]["percent"]
+    pct_s = f"{pct}%{'*' if drive['health']['percent_is_derived'] and pct is not None else ''}" if pct is not None else "—"
+    temp = drive["temperature"].get("c")
+    warn = drive["temperature"].get("warn_at")
+    temp_s = f"{temp}°C" if temp is not None else "—"
+    if isinstance(temp, int) and isinstance(warn, int) and temp >= warn:
+        temp_s = c(temp_s, COLOR["caution"])
+    poh = drive.get("power_on_hours")
+    src = drive["source"]
+    src_s = src if src == "smartctl" else c(src, COLOR["caution"] if src == "cached" else COLOR["unknown"])
+
+    name = c(f"{drive['name'][:15]:<15}", COLOR.get(v, ""))
+    print(f" {GLYPH.get(v,'❔')} {name} {pct_s:>7}  {temp_s:>5}"
+          f"  {(str(poh) if poh is not None else '—'):>7}  "
+          f"{cell('realloc',7)} {cell('pending',5)} {cell('uncorr',6)} {cell('crc',4)}  {src_s}")
+
+
+def print_card(drive, state):
+    v = drive["health"]["verdict"]
+    width = min(shutil.get_terminal_size((100, 24)).columns, 100)
+    # Heading is what the device IS — kind, model, capacity — the way
+    # CrystalDiskInfo titles a drive. Two identical disks share a heading; the
+    # label and mount points below are what tell them apart.
+    heading = drive.get("title") or drive["name"]
+    title = f"{GLYPH.get(v,'❔')} {heading}  —  {v.upper()}"
+    print(c(title, BOLD + COLOR.get(v, "")))
+    print(c("─" * width, DIM))
+
+    def line(label, value):
+        if value in (None, "", []):
+            return
+        print(f"  {c(label + ':', DIM):<28} {value}")
+
+    # Field order follows CrystalDiskInfo: the verdict and temperature you came
+    # for, then the drive's identity, then its counters. Nothing here describes
+    # what the OS does with the disk beyond where it is mounted — CDI's "Drive
+    # Letter" — because the disk does not report that and guessing at it only
+    # duplicated the mount line.
+    pct = drive["health"]["percent"]
+    if pct is not None:
+        bar = health_bar(pct)
+        basis = drive["health"].get("percent_basis")
+        if basis == "hdd_tripwire_heuristic":
+            why = "derived — a spinning disk has no wear counter; a weighted score over baseline-tracked error counters"
+        elif basis == "nvme_percentage_used":
+            why = "from the drive's own wear counter"
+        elif isinstance(basis, str) and basis.startswith("ata_attribute_"):
+            why = "from the drive's own wear attribute " + basis.split("_", 2)[2].replace("_", " ", 1)
+        else:
+            why = "derived" if drive["health"]["percent_is_derived"] else ""
+        line("Health", f"{bar} {pct}%" + (c(f"  ({why})", DIM) if why else ""))
+    elif drive["health"]["verdict"] == "unknown":
+        line("Health", c("unknown — no readable SMART data", COLOR["unknown"]))
+    else:
+        line("Health", c(f"{drive['health']['verdict']} — no usable wear indicator; "
+                         f"verdict is from the four tripwire counters",
+                         COLOR.get(drive["health"]["verdict"], "")))
+
+    temp = drive["temperature"]
+    if temp.get("c") is not None:
+        bits = [f"{temp['c']} °C"]
+        if temp.get("min_c") is not None or temp.get("max_c") is not None:
+            scope = temp.get("minmax_scope") or "min/max"
+            lo = temp["min_c"] if temp.get("min_c") is not None else "?"
+            hi = temp["max_c"] if temp.get("max_c") is not None else "?"
+            bits.append(f"{scope} {lo}–{hi} °C")
+        if temp.get("limit_max"):
+            bits.append(f"limit {temp['limit_max']} °C")
+        over = temp.get("over_limit_minutes")
+        if over:
+            bits.append(c(f"{over} min over limit in its lifetime", COLOR["caution"]))
+        line("Temperature", "   ".join(bits))
+
+    line("Label", drive.get("name"))
+    line("Model", drive.get("model") or "—")
+    line("Firmware", drive.get("firmware"))
+    line("Serial", drive["serial"])
+    line("Capacity", human_bytes(drive.get("capacity_bytes")))
+    line("Interface", drive.get("interface"))
+    line("Transfer mode", drive.get("transfer_mode"))
+    line("Standard", drive.get("standard"))
+    line("Form factor", drive.get("form_factor"))
+    line("Rotation", f"{drive['rotation_rpm']} rpm" if drive.get("rotation_rpm")
+         else ("solid state" if drive.get("type") in ("ssd", "nvme") else None))
+    feats = drive.get("features") or {}
+    on = [k for k, v in (("S.M.A.R.T.", feats.get("smart")), ("APM", feats.get("apm")),
+                         ("AAM", feats.get("aam")), ("TRIM", feats.get("trim")),
+                         ("Write cache", feats.get("write_cache"))) if v is True]
+    off = [k for k, v in (("APM", feats.get("apm")), ("AAM", feats.get("aam")),
+                          ("TRIM", feats.get("trim")),
+                          ("Write cache", feats.get("write_cache"))) if v is False]
+    line("Features", "  ".join(on) + (c("   off: " + " ".join(off), DIM) if off else ""))
+    line("Power state", drive.get("power_state") if drive.get("power_state") != "unknown" else None)
+    # CrystalDiskInfo's "Drive Letter". The only place the OS layout appears.
+    line("Mounted", ", ".join(drive.get("mounts") or []) or "not mounted")
+    # How full it is — from the kernel, not from SMART. One line per distinct
+    # filesystem: btrfs subvolumes of one pool collapse into a single entry.
+    for fs in drive.get("filesystems") or []:
+        pct = fs.get("used_pct")
+        line("Space", f"{fs['mount']}   {human_bytes(fs['used_bytes'])} of "
+                      f"{human_bytes(fs['total_bytes'])}"
+                      + (f"   {pct}% used" if pct is not None else ""))
+    if drive.get("note"):
+        line("Note", drive["note"])
+
+    poh = drive.get("power_on_hours")
+    if poh is not None:
+        base = drive.get("poh_baseline")
+        extra = f"   (+{poh - base} h since baseline)" if isinstance(base, int) else ""
+        line("Power-on hours", f"{poh}   {drive.get('power_on_pretty') or ''}{extra}")
+    line("Power-on count", drive.get("power_cycles"))
+
+    if drive.get("host_writes_bytes") is not None or drive.get("host_reads_bytes") is not None:
+        line("Host writes", human_bytes(drive.get("host_writes_bytes")))
+        line("Host reads", human_bytes(drive.get("host_reads_bytes")))
+    end = drive.get("endurance")
+    if end:
+        line("Endurance", f"{end['written_tb']} TB of {end['rated_tbw']} TBW rated"
+                          f"   ({end['used_pct']}%)")
+
+    nvme = drive.get("nvme")
+    if nvme:
+        line("NVMe", f"used {nvme.get('percentage_used')}%   spare {nvme.get('available_spare')}%"
+                     f" (threshold {nvme.get('spare_threshold')}%)   "
+                     f"media errors {nvme.get('media_errors')}   "
+                     f"err-log {nvme.get('num_err_log_entries')}   "
+                     f"unsafe shutdowns {nvme.get('unsafe_shutdowns')}")
+        if nvme.get("temp_sensors_c"):
+            line("Sensors", "  ".join(f"{t} °C" for t in nvme["temp_sensors_c"]))
+
+    st = drive.get("selftest") or {}
+    if st.get("status"):
+        bits = [str(st["status"])]
+        if st.get("last_kind"):
+            bits.append(f"({st['last_kind']})")
+        if st.get("last_poh") is not None:
+            bits.append(f"at {st['last_poh']} h")
+        if st.get("in_progress_pct") is not None:
+            bits.append(c(f"— running, {st['in_progress_pct']}% done", COLOR["caution"]))
+        line("Last self-test", " ".join(bits))
+
+    line("Data source", drive["source"] + (f"   stale since {drive['data_stale_since']}"
+                                           if drive.get("data_stale_since") else ""))
+    for reason in drive["health"].get("reasons") or []:
+        print(f"  {c('!', COLOR.get(v,''))} {reason}")
+
+    attrs = drive.get("attributes") or []
+    if attrs:
+        print()
+        print(c(f"  {'ID':>3}  {'ATTRIBUTE':<26} {'VAL':>4} {'WST':>4} {'THR':>4}  RAW", DIM))
+        for a in attrs:
+            mark = " "
+            style = ""
+            if a.get("tripwire"):
+                moved = isinstance(a.get("delta"), int) and a["delta"] > 0
+                mark = "!" if moved else "·"
+                style = COLOR["bad"] if moved else ""
+            elif a.get("composite_masked"):
+                mark = "~"
+                style = DIM
+            raw = a.get("raw_decoded") or a.get("raw")
+            row = (f"  {mark}{a['id']:>3} {a.get('name') or '':<26} "
+                   f"{_n(a.get('value')):>4} {_n(a.get('worst')):>4} {_n(a.get('thresh')):>4}  {raw}")
+            print(c(row, style) if style else row)
+        print(c("   ~ composite, not alerted on    · tripwire, at baseline    ! tripwire, moved", DIM))
+    print()
+
+
+def _n(v):
+    return "—" if v is None else str(v)
+
+
+def health_bar(pct, width=20):
+    filled = int(round(pct / 100 * width))
+    colour = COLOR["good"] if pct >= 80 else COLOR["caution"] if pct >= 40 else COLOR["bad"]
+    return c("█" * filled + "░" * (width - filled), colour)
+
+
+# --------------------------------------------------------------------------- #
+# live I/O  —  /proc/diskstats, no SMART, no root
+# --------------------------------------------------------------------------- #
+
+def read_diskstats():
+    """Kernel field layout (post-5.5, 20 fields): index 2 is the device name,
+    [5] sectors read, [9] sectors written, [12] io_ticks in ms. Sectors here are
+    ALWAYS 512 bytes regardless of the drive's physical sector size — a kernel
+    contract, not a guess, so do not 'fix' this with 4096."""
+    stats = {}
+    try:
+        with open("/proc/diskstats", encoding="utf-8") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) < 14:
+                    continue
+                stats[f[2]] = (int(f[5]), int(f[9]), int(f[12]))
+    except OSError:
+        pass
+    return stats
+
+
+def io_targets(state):
+    """device name -> display name, from the collector's own mapping so rows
+    read 'hdd1 (mirror)' rather than 'sda'."""
+    out = {}
+    for drive in state["drives"] + state.get("removable", []):
+        dev = (drive.get("device") or "").removeprefix("/dev/")
+        if dev:
+            out[dev] = drive["name"]
+    return out
+
+
+def cmd_io(args):
+    state = load_state()
+    targets = io_targets(state)
+    if not targets:
+        die("no drives in the state file")
+
+    def sample(prev, dt):
+        rows = []
+        cur = read_diskstats()
+        for dev, name in targets.items():
+            if dev not in cur or dev not in prev:
+                continue
+            (r0, w0, t0), (r1, w1, t1) = prev[dev], cur[dev]
+            read_mb = (r1 - r0) * 512 / 1e6 / dt
+            write_mb = (w1 - w0) * 512 / 1e6 / dt
+            busy = min(100.0, (t1 - t0) / (dt * 1000) * 100)
+            rows.append((name, dev, read_mb, write_mb, busy))
+        return cur, rows
+
+    def render(rows):
+        for name, dev, r, w, busy in rows:
+            if r < 0.05 and w < 0.05:
+                print(f"  {name[:16]:<16} {c('—', DIM):>28}   {c(f'{dev}', DIM)}")
+            else:
+                bar = "▏▎▍▌▋▊▉█"[min(7, int(busy / 12.5))] * max(1, int(busy / 10))
+                print(f"  {name[:16]:<16} R {r:8.1f} MB/s   W {w:8.1f} MB/s   "
+                      f"{busy:5.1f}% {c(bar, COLOR['caution'] if busy > 60 else COLOR['good'])}")
+
+    prev = read_diskstats()
+    if not args.watch:
+        time.sleep(args.interval)
+        _, rows = sample(prev, args.interval)
+        render(rows)
+        return 0
+
+    print(c(f"sampling every {args.interval}s — ctrl-c to stop", DIM))
+    try:
+        while True:
+            time.sleep(args.interval)
+            prev, rows = sample(prev, args.interval)
+            sys.stdout.write("\033[H\033[J" if USE_COLOR else "\n")
+            print(c(f"disk-health io    {datetime.now().strftime('%H:%M:%S')}", BOLD))
+            print()
+            render(rows)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# the rest
+# --------------------------------------------------------------------------- #
+
+def cmd_drives(args):
+    state = load_state()
+    for drive in state["drives"] + state.get("removable", []):
+        kind = "removable" if drive["removable"] else "fixed"
+        identity = drive.get("history_id") or drive.get("identity_wwn") or drive["serial"]
+        print(f"{drive['serial']:<22} {drive['name']:<16} {drive.get('device') or '—':<14} "
+              f"{drive['type']:<5} {kind:<10} {drive['health']['verdict']:<8} history {identity}")
+    return 0
+
+
+def cmd_history(args):
+    state = load_state()
+    requested = args.serial
+    bare_requested = requested[4:] if requested.lower().startswith("wwn:") else requested
+    requested_variants = {requested, bare_requested}
+    if bare_requested.lower().startswith("0x"):
+        requested_variants.add(bare_requested[2:])
+    else:
+        requested_variants.add("0x" + bare_requested)
+    matched = next((drive for drive in state.get("drives", []) + state.get("removable", [])
+                    if requested_variants.intersection(str(value) for value in
+                       (drive.get("serial"), drive.get("history_id"),
+                        drive.get("disk_serial"), drive.get("identity_wwn")) if value)), None)
+    history_id = matched.get("history_id") if matched else requested
+    if os.path.basename(history_id) != history_id or history_id in ("", ".", ".."):
+        die("history identity must be a drive serial, WWN, or history_id from `disk-health drives`")
+    path = os.path.join(STATE_DIR, "history", f"{history_id}.csv")
+    if not os.path.exists(path):
+        available = sorted(f[:-4] for f in os.listdir(os.path.join(STATE_DIR, "history"))
+                           if f.endswith(".csv")) if os.path.isdir(os.path.join(STATE_DIR, "history")) else []
+        die(f"no history for {args.serial}. Have: {', '.join(available) or '(none yet)'}")
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    if not lines:
+        die(f"history file for {args.serial} is empty; wait for the next successful reading")
+    header, rows = lines[0], lines[1:]
+    print(c(header, DIM))
+    for row in rows[-args.tail:]:
+        print(row)
+    print(c(f"\n{len(rows)} samples recorded", DIM))
+    return 0
+
+
+def cmd_events(args):
+    state = load_state()
+    events = state.get("events", [])
+    if not events:
+        print("no events recorded")
+        return 0
+    for event in events[-args.n:]:
+        colour = COLOR["good"] if event["kind"] == "recovery" else COLOR["bad"] if event["to"] == "bad" else COLOR["caution"]
+        kind = c(f"{event['kind']:<16}", colour)
+        print(f"{event['at'][:19].replace('T',' ')}  {kind} {event['message']}")
+    return 0
+
+
+def redacted_state(state):
+    safe = copy.deepcopy(state)
+    safe["host"] = "<redacted>"
+    mapping = {}
+    for index, drive in enumerate(safe.get("drives", []) + safe.get("removable", []), 1):
+        original = str(drive.get("serial") or drive.get("history_id") or index)
+        token = "disk-" + hashlib.sha256(original.encode()).hexdigest()[:10]
+        mapping[original] = token
+        for identity in (drive.get("history_id"), drive.get("disk_serial"),
+                         drive.get("enclosure_serial"), drive.get("identity_wwn")):
+            if identity:
+                mapping[str(identity)] = token
+        drive["name"] = f"drive-{index}"
+        drive["serial"] = token
+        drive["history_id"] = token
+        drive["disk_serial"] = token if drive.get("disk_serial") else None
+        drive["enclosure_serial"] = "<redacted>" if drive.get("enclosure_serial") else None
+        drive["identity_wwn"] = "<redacted>" if drive.get("identity_wwn") else None
+        drive["device"] = "<redacted>" if drive.get("device") else None
+        drive["by_id"] = "<redacted>" if drive.get("by_id") else None
+        drive["note"] = None
+        farm = drive.get("farm") or {}
+        values = farm.get("values") or {}
+        for key, value in list(values.items()):
+            if isinstance(value, str):
+                values[key] = "<redacted>"
+        drive["mounts"] = [f"<mount-{n}>" for n, _ in enumerate(drive.get("mounts") or [], 1)]
+        for n, fs in enumerate(drive.get("filesystems") or [], 1):
+            fs["mount"] = f"<mount-{n}>"
+    for event in safe.get("events", []):
+        original = str(event.get("serial") or "")
+        event["serial"] = mapping.get(original, "<redacted>")
+        if event.get("id"):
+            event["id"] = "event-" + hashlib.sha256(str(event["id"]).encode()).hexdigest()[:12]
+        if event.get("kind") == "identity_change":
+            for field in ("from", "to"):
+                event[field] = mapping.get(str(event.get(field) or ""), "<redacted>")
+        event["message"] = "<redacted diagnostic event; see kind/from/to>"
+    return safe, mapping
+
+
+def create_support_bundle(path, state, redact=False):
+    payload, mapping = redacted_state(state) if redact else (copy.deepcopy(state), {})
+    manifest = {"format": "omarchy-disk-health-support-v1",
+                "created_from": payload.get("collected_at"),
+                "redacted": bool(redact),
+                "contents": ["report.json", "README.txt", "history/*.csv"]}
+    history_dir = os.path.join(STATE_DIR, "history")
+    with tarfile.open(path, "w:gz") as archive:
+        def add_bytes(name, content):
+            raw = content.encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(raw))
+        add_bytes("manifest.json", json.dumps(manifest, indent=2) + "\n")
+        add_bytes("report.json", json.dumps(payload, indent=2) + "\n")
+        add_bytes("README.txt", "Read-only diagnostic bundle. No SMART tests, scans, or raw device data were run.\n")
+        for drive in state.get("drives", []) + state.get("removable", []):
+            history_id = drive.get("history_id")
+            if not history_id:
+                continue
+            try:
+                with open(os.path.join(history_dir, f"{history_id}.csv"), encoding="utf-8") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            name = mapping.get(str(drive.get("serial")), history_id) if redact else history_id
+            add_bytes(f"history/{name}.csv", content)
+
+
+def cmd_report(args):
+    state = load_state()
+    bundle = getattr(args, "bundle", None)
+    redact = getattr(args, "redact", False)
+    if bundle:
+        create_support_bundle(bundle, state, redact)
+        print(f"wrote {bundle} ({os.path.getsize(bundle)} bytes)"
+              + ("; identities redacted" if redact else ""))
+        return 0
+    if redact:
+        state, _ = redacted_state(state)
+    if args.json:
+        text = json.dumps(state, indent=2) + "\n"
+    else:
+        global USE_COLOR
+        USE_COLOR = False                       # a report is for pasting, not a terminal
+        import io as _io
+        buf = _io.StringIO()
+        stdout, sys.stdout = sys.stdout, buf
+        try:
+            print(f"disk-health report — {state['host']} — {state['collected_at']}")
+            print(f"overall: {state['overall']['verdict']}\n")
+            for drive in state["drives"]:
+                print_card(drive, state)
+            for drive in state.get("removable", []):
+                print_card(drive, state)
+        finally:
+            sys.stdout = stdout
+        text = buf.getvalue()
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print(f"wrote {args.output} ({len(text)} bytes)")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="disk-health", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("status", help="one line per drive (--full for the cards)")
+    p.add_argument("--full", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("drives", help="serial / name / device mapping")
+    p.set_defaults(func=cmd_drives)
+
+    p = sub.add_parser("io", help="live throughput per drive")
+    p.add_argument("--watch", "-w", action="store_true")
+    p.add_argument("--interval", "-i", type=float, default=1.0)
+    p.set_defaults(func=cmd_io)
+
+    p = sub.add_parser("history", help="recorded time series for one drive")
+    p.add_argument("serial")
+    p.add_argument("--tail", "-n", type=int, default=20)
+    p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("events", help="recent state transitions")
+    p.add_argument("-n", type=int, default=20)
+    p.set_defaults(func=cmd_events)
+
+    p = sub.add_parser("report", help="full card set, for the vault or a ticket")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--text", action="store_true")
+    p.add_argument("--output", "-o")
+    p.add_argument("--bundle", metavar="FILE", help="write a tar.gz support bundle")
+    p.add_argument("--redact", action="store_true", help="remove host, serial, path and note identity")
+    p.set_defaults(func=cmd_report)
+
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        args = ap.parse_args(["status"])
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        os._exit(0)

@@ -1,0 +1,12 @@
+[Unit]
+Description=Safety net for the disk-health notifier
+
+[Timer]
+# The path unit is the fast path. This exists because a missed inotify event
+# would mean a silent alert, and silence from a monitoring tool reads as good
+# news. Duplicate runs are free: every event is deduped by id.
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

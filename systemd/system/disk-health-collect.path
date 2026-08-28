@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect immediately when smartd drops an alert
+
+[Path]
+# The -M exec bridge touches this file, so a smartd-detected failure surfaces
+# in seconds instead of waiting out the remaining 29 minutes of the timer.
+PathExists=/var/lib/disk-health/collect.trigger
+Unit=disk-health-collect.service
+
+[Install]
+WantedBy=paths.target

@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible Disk Status problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste raw SMART output or `disk-health.json`. Create a redacted bundle with:
+        `disk-health report --bundle disk-status-support.tar.gz --redact`
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Disk Status version
+      placeholder: 1.10.0
+    validations:
+      required: true
+  - type: input
+    id: omarchy
+    attributes:
+      label: Omarchy version
+      description: Output of `omarchy version`
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Interface mode
+      options:
+        - Bar widget
+        - Popup dashboard
+        - Pinned sidebar
+        - CLI or collector
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnostics
+      description: Attach a redacted support bundle or paste only sanitized logs.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I checked that attachments contain no serials, WWNs, hostnames, mount paths, or notes.
+          required: true

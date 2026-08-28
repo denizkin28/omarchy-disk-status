@@ -1,0 +1,2479 @@
+#!/usr/bin/env python3
+"""disk-health-collect — the privileged collector.
+
+Reads SMART for every fixed drive with smartctl, decides a verdict against the
+accepted baseline, and writes ONE state file that every other component reads:
+
+    /var/lib/disk-health/disk-health.json
+
+Nothing else in this project parses SMART. The bar widget, the CLI and the
+notifier all read that JSON, so its schema is a contract — written out in
+README, "The state file, key by key", which is kept true as this file changes.
+
+Runs as root from a systemd timer. Never notifies anything: root has no session
+bus, and a collector that blocks on a desktop is a collector that hangs.
+
+Design rules carried from the brief, not to be re-litigated:
+  * A drive with no readable data is "unknown" (⚠️), NEVER "good".
+  * Tripwires compare against baselines.json, not against zero — these are
+    ex-farm drives that arrived with hours on them.
+  * Seagate attributes 1 and 7 are composites that climb during normal reads.
+    They are recorded but excluded from alerting.
+  * Never wake a sleeping drive to check it (-n standby,q). A skipped drive
+    carries forward its previous values with source="cached".
+  * Removable drives never influence the overall verdict.
+
+Options:
+  --dump-raw DIR   also write each smartctl invocation's raw JSON to DIR
+  --fixtures DIR   read those files instead of running smartctl (no root needed;
+                   this is how the collector is developed and tested)
+  --dry-run        compute everything, print the JSON, write nothing
+"""
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import pwd
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+SCHEMA = 1
+
+STATE_DIR = os.environ.get("DISK_HEALTH_STATE", "/var/lib/disk-health")
+LOG_WRITES_ENABLED = True
+
+# Error counters with useful, sufficiently common semantics. Compared against
+# baseline, never zero: an accepted used drive may already carry old events.
+TRIPWIRES = {
+    5:   "Reallocated_Sector_Ct",
+    187: "Reported_Uncorrect",
+    188: "Command_Timeout",
+    197: "Current_Pending_Sector",
+    198: "Offline_Uncorrectable",
+    199: "UDMA_CRC_Error_Count",
+}
+# Increases here are fatal (retire the drive); the others are warnings.
+TRIPWIRE_BAD = {5, 187, 198}
+
+# Seagate composites: huge, always moving, meaningless. Applied only when
+# smartctl identifies a Seagate model family; recorded, never alerted.
+COMPOSITE_MASKED = {1, 7}
+
+# Normalised wear indicators on SATA SSDs. The NORMALISED value of these
+# counts down from 100 to the threshold, so it reads directly as "life left" —
+# unlike the raw value, which is vendor-specific. First one present wins.
+# Partition-table boilerplate that names nothing. Anything here is ignored
+# when deriving a drive title.
+GENERIC_PARTLABELS = {
+    "primary", "data", "basic data partition", "efi system partition",
+    "linux filesystem", "microsoft reserved partition", "microsoft basic data",
+    "bios boot partition", "linux swap", "lvm", "root", "boot", "esp",
+}
+
+SSD_WEAR_ATTRS = [
+    (231, "SSD_Life_Left"),
+    (233, "Media_Wearout_Indicator"),
+    (177, "Wear_Leveling_Count"),
+    (232, "Available_Reservd_Space"),
+]
+
+USB_SMART_TRANSPORTS = ("sat", "sntasmedia", "sntjmicron", "sntrealtek", "scsi")
+SMARTCTL_DRIVE_BUDGET_SECONDS = 90
+# Leave enough room inside systemd's 300-second TimeoutStartSec to serialize,
+# fsync and publish an honest partial result even when several bridges wedge.
+COLLECTOR_RUN_BUDGET_SECONDS = 220
+
+DEFAULT_THRESHOLDS = {
+    "hdd_temp_warn": 55,
+    "ssd_temp_warn": 70,
+    "nvme_temp_warn": 70,
+    # Life REMAINING, not NVMe spare blocks: this is what the old
+    # nvme_spare_warn key always did, under a name that described neither.
+    "wear_warn_pct": 20,
+    "io_show_mbps": 10,
+    "stale_minutes": 45,
+}
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
+
+def g(obj, *path, default=None):
+    """Safe nested lookup. smartctl's JSON varies by device, firmware and
+    version; every access goes through here so a missing key is a None, not a
+    traceback that kills the whole collection run."""
+    cur = obj
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        elif isinstance(cur, (list, tuple)) and isinstance(key, int) and -len(cur) <= key < len(cur):
+            cur = cur[key]
+        else:
+            return default
+        if cur is None:
+            return default
+    return cur
+
+
+def now_iso():
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def human_size(n):
+    """Capacity the way a drive is sold: 22.0 TB, not 22 TB or 22000 GB."""
+    if not isinstance(n, (int, float)):
+        return ""
+    for unit in ("B", "KB", "MB"):
+        if abs(n) < 1000:
+            return f"{n:.0f} {unit}"
+        n /= 1000
+    for unit in ("GB", "TB"):
+        if abs(n) < 1000:
+            return f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} PB"
+
+
+def pretty_hours(h):
+    if h is None:
+        return None
+    return f"{h // 24}d {h % 24}h"
+
+
+def safe_history_id(value):
+    """Stable filename component without assuming a serial's character set."""
+    original = "" if value is None else str(value)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", original).strip("._")
+    if safe and safe == original and safe not in (".", ".."):
+        return safe
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()[:12]
+    return f"{safe or 'drive'}-{digest}"
+
+
+def duplicate_suffix(wwn, model, size, stable_path):
+    if wwn:
+        return str(wwn)
+    material = f"{model or ''}|{size or 0}|{stable_path or ''}"
+    return "id-" + hashlib.sha256(material.encode()).hexdigest()[:12]
+
+
+def previous_drive_for(dev, path, previous):
+    """Find prior state before SMART has replaced an enclosure identity."""
+    serial = dev.get("serial")
+    direct = previous.get(serial)
+    if direct is not None:
+        return direct
+    return next((old for old in previous.values()
+                 if old.get("enclosure_serial") == serial
+                 or old.get("by_id") == path
+                 or (dev.get("wwn") and old.get("identity_wwn") == dev.get("wwn"))), {})
+
+
+def log_line(text):
+    if not LOG_WRITES_ENABLED:
+        return
+    path = os.path.join(STATE_DIR, "disk-health.log")
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z')}\t{text}\n")
+    except OSError:
+        pass
+
+
+def log_daily(key, text):
+    """Rate-limit persistent discovery limitations to one line per day."""
+    marker_dir = os.path.join(STATE_DIR, ".log-rate-limit")
+    marker = os.path.join(marker_dir, hashlib.sha256(str(key).encode()).hexdigest()[:20])
+    try:
+        if time.time() - os.path.getmtime(marker) < 86400:
+            return
+    except OSError:
+        pass
+    log_line(text)
+    try:
+        os.makedirs(marker_dir, exist_ok=True)
+        with open(marker, "a", encoding="utf-8"):
+            os.utime(marker, None)
+        chown_owner(marker_dir)
+        chown_owner(marker)
+    except OSError:
+        pass
+
+
+def state_owner():
+    """(uid, gid) of the account this install belongs to, or (None, None).
+
+    The state tree IS the record of who that is: install.sh creates it owned by
+    whoever ran sudo. Asking it beats naming an account in the source, which
+    only ever worked on the machine the source was written on.
+
+    Several candidates, because the state ROOT can legitimately be root-owned —
+    it is often a pre-existing directory on a mirrored disk that install.sh was
+    pointed at with --state, while the subdirectories it created are the user's.
+    DISK_HEALTH_OWNER overrides the lot.
+    """
+    named = os.environ.get("DISK_HEALTH_OWNER")
+    if named:
+        try:
+            entry = pwd.getpwnam(named)
+            return entry.pw_uid, entry.pw_gid
+        except KeyError:
+            pass
+    for candidate in ("history", "events", "", "disk-health.json"):
+        try:
+            st = os.stat(os.path.join(STATE_DIR, candidate))
+        except OSError:
+            continue
+        if st.st_uid:                    # root-owned tells us nothing
+            return st.st_uid, st.st_gid
+    return None, None
+
+
+def chown_owner(path):
+    """State is written by root but read by the user's bar widget."""
+    uid, gid = state_owner()
+    if not uid:                      # unreadable, or a root-owned state dir
+        return
+    try:
+        os.chown(path, uid, gid)
+    except (PermissionError, OSError):
+        pass
+
+
+def default_config_path():
+    """Where this install's disk-health.toml lives.
+
+    Root has no ~/.config/omarchy; the account that owns the state directory
+    does, and that is the same account install.sh wrote the file for. The unit
+    passes no --config, so getting this wrong means the config is read on no
+    machine but the author's. DISK_HEALTH_CONFIG overrides it.
+    """
+    env = os.environ.get("DISK_HEALTH_CONFIG")
+    if env:
+        return env
+    uid, _ = state_owner()
+    home = None
+    if uid:
+        try:
+            home = pwd.getpwuid(uid).pw_dir
+        except KeyError:
+            home = None
+    return os.path.join(home or os.path.expanduser("~"),
+                        ".config", "omarchy", "disk-health.toml")
+
+
+def write_atomic(path, text, mode=0o644):
+    """Never let a reader see a half-written state file."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        chown_owner(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# config / baselines / previous state
+# --------------------------------------------------------------------------- #
+
+def load_config(path):
+    cfg = {"names": {}, "notes": {}, "kinds": {}, "endurance": {},
+           "thresholds": dict(DEFAULT_THRESHOLDS),
+           "ignore": {"serials": []}, "fixed": {"serials": []}, "removable": {"serials": []}}
+    try:
+        import tomllib
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except FileNotFoundError:
+        log_line(f"collector\tconfig not found at {path}, using defaults")
+        return cfg
+    except Exception as exc:                                  # malformed TOML
+        log_line(f"collector\tconfig at {path} unreadable ({exc}), using defaults")
+        return cfg
+    for section in ("names", "kinds", "endurance"):
+        if isinstance(raw.get(section), dict):
+            cfg[section] = raw[section]
+    if isinstance(raw.get("notes"), dict):
+        cfg["notes"].update(raw["notes"])
+    if isinstance(raw.get("thresholds"), dict):
+        thresholds = dict(raw["thresholds"])
+        # nvme_spare_warn was this key's name in the shipped config file, and
+        # that file is never overwritten once installed.
+        if "wear_warn_pct" not in thresholds and "nvme_spare_warn" in thresholds:
+            thresholds["wear_warn_pct"] = thresholds.pop("nvme_spare_warn")
+        thresholds.pop("nvme_spare_warn", None)
+        cfg["thresholds"].update(thresholds)
+    if isinstance(g(raw, "ignore", "serials"), list):
+        cfg["ignore"]["serials"] = [str(s) for s in raw["ignore"]["serials"]]
+    for section in ("fixed", "removable"):
+        if isinstance(g(raw, section, "serials"), list):
+            cfg[section] = {"serials": [str(s) for s in raw[section]["serials"]]}
+    return cfg
+
+
+def load_json_file(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------- #
+# device discovery
+# --------------------------------------------------------------------------- #
+
+def list_block_devices():
+    """Every whole disk, with serial, size, rotation, transport and mounts."""
+    try:
+        out = subprocess.run(
+            ["lsblk", "--json", "-b", "-o",
+             "NAME,SERIAL,WWN,MODEL,SIZE,ROTA,TRAN,TYPE,RM,HOTPLUG,LABEL,PARTLABEL,FSTYPE,MOUNTPOINTS"],
+            capture_output=True, text=True, timeout=30, check=True).stdout
+        data = json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log_line(f"collector\tlsblk failed: {exc}")
+        return None
+
+    devices = []
+    for blk in data.get("blockdevices", []):
+        if blk.get("type") != "disk":
+            continue
+        name = blk.get("name") or ""
+        if name.startswith("zram") or name.startswith("loop"):
+            continue
+        mounts, labels, partlabels, fstypes = [], [], [], []
+
+        def walk(node):
+            for m in (node.get("mountpoints") or []):
+                if m:
+                    mounts.append(m)
+            # A filesystem label is the name a person actually chose for this
+            # storage. It beats a model number for a card title, and unlike
+            # anything in a config file it is already on the disk.
+            v = (node.get("label") or "").strip()
+            if v and v not in labels:
+                labels.append(v)
+            # Partition labels are a weaker signal — partitioning tools write
+            # boilerplate like "primary" or "EFI System Partition" that names
+            # nothing. Kept separately and only used if there is no real label.
+            pv = (node.get("partlabel") or "").strip()
+            if pv and pv.lower() not in GENERIC_PARTLABELS and pv not in partlabels:
+                partlabels.append(pv)
+            ft = (node.get("fstype") or "").strip()
+            if ft and ft not in fstypes:
+                fstypes.append(ft)
+            for child in (node.get("children") or []):
+                walk(child)
+
+        walk(blk)
+        mounts = [m for m in mounts if not is_sandbox_mount(m)]
+        serial = (blk.get("serial") or "").strip()
+        wwn = (blk.get("wwn") or "").strip()
+        devices.append({
+            "name": name,
+            # WWN is a stable hardware identifier when a bridge exposes no
+            # serial. A device with neither remains skipped rather than being
+            # keyed by the boot-dependent /dev/sdX name.
+            "serial": serial or ("wwn:" + wwn if wwn else ""),
+            "wwn": wwn,
+            "model": (blk.get("model") or "").strip(),
+            "size": blk.get("size"),
+            "rota": bool(blk.get("rota")),
+            "tran": blk.get("tran") or "",
+            # HOTPLUG is the kernel's own answer to "can this be pulled while
+            # the machine runs" — it is set for USB, Thunderbolt and other
+            # hot-pluggable buses. RM is a different flag (removable MEDIA, as
+            # in a card reader slot) and is 0 even for a USB SSD, which is why
+            # transport sniffing was needed before and is not now.
+            "hotplug": bool(blk.get("hotplug")),
+            "media_removable": bool(blk.get("rm")),
+            "labels": labels or partlabels,
+            "fstypes": fstypes,
+            "mounts": mounts,
+        })
+    return devices
+
+
+def byid_paths():
+    """serial -> the /dev/disk/by-id path we address the drive by.
+
+    Never /dev/sdX: the letters move between boots. Prefer the model+serial
+    form over eui/wwn aliases so the path is human-readable in logs and in
+    smartd.conf.
+    """
+    result = {}
+    base = "/dev/disk/by-id"
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return result
+    for entry in entries:
+        if "-part" in entry or entry.startswith("nvme-eui."):
+            continue
+        path = os.path.join(base, entry)
+        try:
+            target = os.path.basename(os.path.realpath(path))
+        except OSError:
+            continue
+        old = result.get(target)
+        unsuffixed = not re.search(r"_\d+$", entry)
+        old_unsuffixed = old is not None and not re.search(r"_\d+$", os.path.basename(old))
+        if (old is None or (unsuffixed and not old_unsuffixed)
+                or (unsuffixed == old_unsuffixed and len(entry) > len(os.path.basename(old)))):
+            result[target] = path
+    return result
+
+
+def is_sandbox_mount(path):
+    """Is this "mount" an artefact of our own systemd sandbox?
+
+    The collector unit runs ProtectSystem=strict with
+    ReadWritePaths=/var/lib/disk-health, and systemd implements that by
+    bind-mounting the resolved path read-write INSIDE the unit's namespace. So
+    `lsblk`, run from in there, reports the state directory as a mount point
+    that does not exist on the host — and the card then listed
+    "/srv/storage/state" as somewhere the drive is mounted.
+
+    The sandbox that protects the system also distorts what the process inside
+    it can see. Filter our own paths back out.
+    """
+    if not path:
+        return False
+    try:
+        real = os.path.realpath(path)
+        state_real = os.path.realpath(STATE_DIR)
+    except OSError:
+        return False
+    return real == state_real or real.startswith(state_real.rstrip("/") + "/")
+
+
+def filesystem_usage(mounts):
+    """How full each mounted filesystem on this drive is.
+
+    Not SMART, and not something CrystalDiskInfo shows — but "how much room is
+    left" is the other question you open a disk panel to answer, and the kernel
+    answers it for free through statvfs. It works inside the collector's
+    sandbox: ProtectSystem=strict makes the tree read-only, which statvfs does
+    not care about.
+
+    ONE ENTRY PER DISTINCT FILESYSTEM. A btrfs root with subvolumes mounts as
+    /, /var/log, /var/cache/pacman/pkg … all backed by the same pool, and
+    printing the same "1.9 TB of 3.6 TB" five times is noise. Identical
+    (block count, block size, inode count) means the same filesystem; the
+    shortest mount path is the one worth naming.
+
+    `used_pct` is df's definition — used against what a normal user can still
+    write — so a filesystem with a 5 % root reserve reads 100 % full when it is
+    full for everybody but root.
+    """
+    groups = {}
+    for mount in mounts:
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            continue                       # unmounted underneath us, or denied
+        if not st.f_blocks or not st.f_frsize:
+            continue
+        key = (st.f_blocks, st.f_frsize, st.f_files)
+        groups.setdefault(key, (st, []))[1].append(mount)
+    out = []
+    for (blocks, frsize, _), (st, paths) in groups.items():
+        total = blocks * frsize
+        avail = st.f_bavail * frsize
+        used = (blocks - st.f_bfree) * frsize
+        denominator = used + avail
+        out.append({
+            "mount": min(paths, key=len),
+            "total_bytes": total,
+            "used_bytes": used,
+            "avail_bytes": avail,
+            "used_pct": round(used / denominator * 100, 1) if denominator else None,
+        })
+    return sorted(out, key=lambda f: f["mount"])
+
+
+def derive_kind(dev, data):
+    """What KIND of device this is, in the words a person would use.
+
+    Assembled from three things the hardware reports:
+      * transport (`lsblk TRAN`) — nvme, usb, sata
+      * rotation rate — non-zero means platters
+      * ATA form factor — the drive's own identify data, which is how an M.2
+        stick in a USB enclosure can be recognised as M.2 rather than guessed
+
+    The form factor is only trusted from the ATA/SAT path. Asked over `-d scsi`
+    the same enclosure answers "2.5 inches", because the bridge is describing
+    itself rather than the drive inside it.
+    """
+    if smartctl_is_nvme(data, dev.get("tran") == "nvme"):
+        return "NVMe"
+
+    name = dev.get("name") or ""
+    tran = (dev.get("tran") or "").lower()
+    if name.startswith("mmcblk"):
+        return "SD card" if dev.get("media_removable") or dev.get("hotplug") else "eMMC"
+    if name.startswith(("vd", "xvd")) or tran == "virtio":
+        return "Virtual disk"
+
+    ff = g(data, "form_factor", "name") or ""
+    usb = dev.get("tran") == "usb"
+
+    if dev.get("rota"):
+        base = "HDD"
+    elif usb and not has_smart_evidence(data):
+        # No SMART behind the bridge at all: a flash stick, not a drive.
+        return "USB stick"
+    elif ff.upper() == "M.2":
+        base = "M.2 SSD"          # NGFF
+    elif ff.startswith("mSATA"):
+        base = "mSATA SSD"
+    else:
+        base = "SSD"
+    return f"{base} (USB)" if usb else base
+
+
+def derive_title(dev, kind, capacity):
+    """The card heading: what the thing IS, in the order you would say it.
+
+        HDD · ST22000NM001E-3HM103 · 22.0 TB
+
+    Separated with "·" rather than "-" because model numbers contain hyphens
+    and "HDD - ST22000NM001E-3HM103 - 22.0 TB" cannot be parsed by eye.
+
+    This does NOT identify a drive on its own — two identical disks give the
+    same heading, which is exactly what CrystalDiskInfo's title bar does too.
+    The label and the mount points are what tell them apart, and both are on
+    the card.
+    """
+    bits = [kind]
+    model = (dev.get("model") or "").strip()
+    if model:
+        bits.append(model)
+    if isinstance(capacity, (int, float)) and capacity > 0:
+        bits.append(human_size(capacity))
+    return " · ".join(bits)
+
+
+def derive_name(dev):
+    """A title for the card, without anyone having to write a config file.
+
+    Order of preference:
+      1. the filesystem label — the name a human already gave this storage
+      2. "root" if it carries /, which is more use than any label would be
+      3. the mount point's last component
+      4. the model
+      5. the serial, which always exists
+    """
+    labels = dev.get("labels") or []
+    if labels:
+        return " + ".join(labels[:2])
+    mounts = dev.get("mounts") or []
+    if "/" in mounts:
+        return "root"
+    for m in mounts:
+        base = os.path.basename(m.rstrip("/"))
+        if base:
+            return base
+    return dev.get("model") or dev.get("serial") or dev.get("name")
+
+
+def configured_for(cfg, section, serial, default=None):
+    values = cfg.get(section) or {}
+    if serial in values:
+        return values[serial]
+    base = serial.split("@", 1)[0]
+    return values.get(base, default)
+
+
+def is_removable(dev, cfg):
+    """Hot-pluggable unless the machine's owner says otherwise.
+
+    The kernel's HOTPLUG flag already knows: it is set for USB, Thunderbolt and
+    friends, and clear for the drives bolted inside the case. Overrides exist
+    for the cases it gets wrong — an eSATA disk that never moves, or an
+    internal bay that does.
+    """
+    serial = dev.get("serial") or ""
+    base = serial.split("@", 1)[0]
+    if serial and ({serial, base} & set(cfg.get("fixed", {}).get("serials", []) or [])):
+        return False
+    if serial and ({serial, base} & set(cfg.get("removable", {}).get("serials", []) or [])):
+        return True
+    return bool(dev.get("hotplug"))
+
+
+def interface_string(devname, tran):
+    """Link speed from sysfs — unprivileged, and more truthful than a label."""
+    if tran == "nvme":
+        m = re.match(r"(nvme\d+)", devname)
+        if m:
+            ctrl = f"/sys/class/nvme/{m.group(1)}/device"
+            speed = read_first_line(f"{ctrl}/current_link_speed")
+            width = read_first_line(f"{ctrl}/current_link_width")
+            if speed and width:
+                gen = {"2.5 GT/s PCIe": "1.0", "5.0 GT/s PCIe": "2.0",
+                       "8.0 GT/s PCIe": "3.0", "16.0 GT/s PCIe": "4.0",
+                       "32.0 GT/s PCIe": "5.0"}.get(speed.strip())
+                return f"PCIe {gen} x{width}" if gen else f"{speed} x{width}"
+        return "NVMe"
+    if tran == "sata":
+        # Walk ata_link/* to find the one behind this block device.
+        try:
+            hostpath = os.path.realpath(f"/sys/block/{devname}")
+            m = re.search(r"/(ata\d+)/", hostpath)
+            if m:
+                link_glob = f"/sys/class/ata_link"
+                for link in os.listdir(link_glob):
+                    lp = os.path.realpath(os.path.join(link_glob, link))
+                    if f"/{m.group(1)}/" in lp + "/":
+                        spd = read_first_line(os.path.join(link_glob, link, "sata_spd"))
+                        if spd and spd != "<unknown>":
+                            return f"SATA {spd}"
+        except OSError:
+            pass
+        return "SATA"
+    if tran:
+        return tran.upper()
+    return "unknown"
+
+
+def nvme_transfer_mode(devname):
+    """smartctl reports no interface_speed for NVMe, so read the PCIe link from
+    sysfs and render it the way CrystalDiskInfo does: current | max."""
+    m = re.match(r"(nvme\d+)", devname)
+    if not m:
+        return None
+    ctrl = f"/sys/class/nvme/{m.group(1)}/device"
+    cur_s, cur_w = read_first_line(f"{ctrl}/current_link_speed"), read_first_line(f"{ctrl}/current_link_width")
+    max_s, max_w = read_first_line(f"{ctrl}/max_link_speed"), read_first_line(f"{ctrl}/max_link_width")
+    if not cur_s:
+        return None
+    cur = f"{cur_s} x{cur_w}" if cur_w else cur_s
+    if max_s:
+        return f"{cur} | {max_s} x{max_w}" if max_w else f"{cur} | {max_s}"
+    return cur
+
+
+def read_first_line(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.readline().strip()
+    except OSError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# smartctl
+# --------------------------------------------------------------------------- #
+
+def run_smartctl(byid, is_nvme, dump_dir=None, fixtures=None, transport=None,
+                 guard_standby=True, timeout=30, extra_args=None):
+    """Return (parsed_json_or_None, note).
+
+    -n standby makes smartctl exit without touching a sleeping drive rather
+    than spinning up 20 TB to read a temperature.
+
+    USB enclosures need an explicit device type: the kernel presents them as
+    SCSI and smartctl's auto-detect often gives up. So for a USB drive we try
+    auto, then `-d sat` (the common bridge), then `-d scsi`. Most cheap sticks
+    have no ATA passthrough at all and all three fail — that is a legitimate
+    "SMART: n/a", not an error worth retrying every 30 minutes forever.
+    """
+    key = os.path.basename(byid) + (f".{transport}" if transport else "") + ".json"
+
+    if fixtures:
+        path = os.path.join(fixtures, key)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh), None
+        except (OSError, ValueError) as exc:
+            return None, f"fixture unreadable: {exc}"
+
+    cmd = ["smartctl", "--json=c", "-x"]
+    if is_nvme:
+        cmd += ["-d", "nvme"]
+    elif guard_standby:
+        # smartctl: -n MODE[,STATUS] — the ",q" suffix is smartd.conf-only and
+        # makes smartctl exit 1 with INVALID ARGUMENT, reading nothing.
+        #
+        # Only for ROTATING disks. The guard exists so we never spin up a 20 TB
+        # platter to read a temperature. An SSD has nothing to spin up, and
+        # applying it there is pure loss: the M.2 SSD in the USB enclosure
+        # reported STANDBY, smartctl obeyed, and the drive went unread for the
+        # life of the project while looking like a bridge that could not do
+        # SMART. It could — we were telling it not to try.
+        cmd += ["-n", "standby"]
+    if transport:
+        cmd += ["-d", transport]
+    if extra_args:
+        cmd += list(extra_args)
+    cmd.append(byid)
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=max(1, timeout))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"smartctl failed to run: {exc}"
+
+    raw = proc.stdout or ""
+    if dump_dir:
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            with open(os.path.join(dump_dir, key), "w", encoding="utf-8") as fh:
+                fh.write(raw)
+            chown_owner(os.path.join(dump_dir, key))
+        except OSError:
+            pass
+
+    if not raw.strip():
+        return None, f"smartctl produced no output (exit {proc.returncode}): {(proc.stderr or '').strip()[:200]}"
+    try:
+        return json.loads(raw), None
+    except ValueError as exc:
+        return None, f"smartctl output was not JSON: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# building a drive record
+# --------------------------------------------------------------------------- #
+
+def power_mode_name(data, default="unknown"):
+    """smartctl gives {"ata_value":0,"name":"STANDBY"} on ATA and a bare string
+    on other transports."""
+    pm = g(data, "power_mode")
+    if isinstance(pm, dict):
+        return str(pm.get("name") or default).lower()
+    if isinstance(pm, str) and pm:
+        return pm.lower()
+    return default
+
+
+def is_standby_response(data):
+    messages = " ".join(str(g(m, "string", default=""))
+                        for m in (g(data, "smartctl", "messages", default=[]) or []))
+    return bool(re.search(r"\bin\s+(STANDBY|SLEEP|IDLE)\s+MODE\b", messages, re.I))
+
+
+def smartctl_is_nvme(data, kernel_hint=False):
+    """Trust identify data over the transport bus (NVMe may be behind USB)."""
+    protocol = g(data, "device", "protocol")
+    return (isinstance(protocol, str) and protocol.lower() == "nvme") or bool(
+        g(data, "nvme_smart_health_information_log", default=None)) or kernel_hint
+
+
+def smartctl_is_scsi(data):
+    protocol = g(data, "device", "protocol")
+    return ((isinstance(protocol, str) and protocol.lower() in ("scsi", "sas"))
+            or g(data, "scsi_grown_defect_list", default=None) is not None
+            or g(data, "scsi_error_counter_log", default=None) is not None)
+
+
+def mmc_health_data(devname):
+    """Read standard JEDEC eMMC lifetime registers without touching the disk."""
+    base = f"/sys/block/{devname}/device"
+    try:
+        life = read_first_line(os.path.join(base, "life_time")) or ""
+        pre_eol = read_first_line(os.path.join(base, "pre_eol_info")) or ""
+        life_values = [int(value, 16) for value in life.split() if value.startswith("0x")]
+        eol_value = int(pre_eol, 16) if pre_eol.startswith("0x") else None
+    except (OSError, ValueError):
+        return None
+    if not life_values and eol_value is None:
+        return None
+    used = min(100, max(life_values) * 10) if life_values else None
+    return {"device": {"protocol": "MMC"}, "mmc_health": {
+        "life_time_raw": life, "pre_eol_raw": pre_eol,
+        "percentage_used_upper_bound": used, "pre_eol": eol_value}}
+
+
+def smartctl_disk_serial(data):
+    """The medium/controller serial reported by SMART identify data.
+
+    lsblk may expose a USB enclosure's serial instead. That identifier is
+    useful for describing the path, but must never own a disk baseline.
+    """
+    value = g(data, "serial_number")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def apply_disk_identity(dev, data, previous, byid):
+    """Return a device keyed by the medium, never blindly by its enclosure."""
+    identified = dict(dev)
+    kernel_serial = identified.get("serial")
+    disk_serial = smartctl_disk_serial(data)
+    if disk_serial:
+        identified["serial"] = disk_serial
+        if kernel_serial != disk_serial:
+            identified["enclosure_serial"] = kernel_serial
+        return identified, disk_serial
+
+    # An asleep/temporarily opaque bridge cannot identify its medium. Reuse
+    # only a disk identity previously observed on this exact stable path.
+    prior = next((old for old in previous.values()
+                  if old.get("by_id") == byid and old.get("disk_serial")), None)
+    if prior:
+        identified["enclosure_serial"] = kernel_serial
+        identified["serial"] = prior["serial"]
+    return identified, None
+
+
+def has_smart_evidence(data):
+    """Did we actually read health data, or just identify the device?
+
+    `-d scsi` on a cheap USB bridge answers a SCSI INQUIRY and returns
+    `model_name` with exit_status 4 and nothing else — no smart_status, no
+    attributes, no temperature. Treating a model name as proof of SMART made
+    the MS06 render as a healthy 100 % drive at 0 °C, which is the exact
+    false-green this tool exists to prevent. Demand real evidence.
+    """
+    if not data:
+        return False
+    if g(data, "smart_status", "passed") is not None:
+        return True
+    if g(data, "ata_smart_attributes", "table"):
+        return True
+    if g(data, "nvme_smart_health_information_log"):
+        return True
+    if g(data, "scsi_grown_defect_list", default=None) is not None:
+        return True
+    if g(data, "scsi_error_counter_log", default=None) is not None:
+        return True
+    if g(data, "mmc_health", default=None):
+        return True
+    if g(data, "scsi_percentage_used_endurance_indicator", default=None) is not None:
+        return True
+    if isinstance(g(data, "power_on_time", "hours"), int):
+        return True
+    # A temperature of exactly 0 is what an empty SCSI response looks like.
+    temp = g(data, "temperature", "current")
+    return isinstance(temp, int) and temp > 0
+
+
+def prev_has_data(prev):
+    """True only if the previous record carried real readings. "cached" must
+    mean "we once read this drive"; without this test a device that has never
+    been readable is marked cached on one run and stays cached forever, which
+    reads as stale-but-known when the truth is never-known."""
+    if not prev:
+        return False
+    return (prev.get("power_on_hours") is not None
+            or bool(prev.get("attributes"))
+            or bool(prev.get("nvme"))
+            or bool(prev.get("scsi")))
+
+
+def decode_seagate_194(raw):
+    """Attr 194's raw value is a composite on Seagate: the current temperature
+    is the low byte, with min/max packed into higher bytes. Reading the whole
+    number as a temperature gives absurdities like 98784247847 °C."""
+    if raw is None:
+        return None, None
+    current = raw & 0xFF
+    b4 = (raw >> 32) & 0xFF
+    b2 = (raw >> 16) & 0xFF
+    others = sorted({b for b in (b2, b4) if 0 < b < 120})
+    lo = others[0] if others else None
+    hi = others[-1] if len(others) > 1 else None
+    return current, (lo, hi)
+
+
+def is_seagate_ata(data):
+    family = g(data, "model_family")
+    return isinstance(family, str) and family.lower().startswith("seagate")
+
+
+def build_attributes(data, baseline_counters, seagate=False):
+    """The CrystalDiskInfo lower pane: every ATA attribute, decoded."""
+    table = g(data, "ata_smart_attributes", "table", default=[]) or []
+    out = []
+    for entry in table:
+        aid = g(entry, "id")
+        if aid is None:
+            continue
+        raw_val = g(entry, "raw", "value")
+        raw_str = g(entry, "raw", "string")
+        masked = seagate and aid in COMPOSITE_MASKED
+        is_trip = aid in TRIPWIRES
+        decoded = raw_str if raw_str is not None else (str(raw_val) if raw_val is not None else None)
+
+        if seagate and aid == 194 and isinstance(raw_val, int) and not raw_str:
+            # Only if smartctl gave us nothing: the low byte is the current
+            # temperature. The lifetime min/max come from smartctl's own
+            # temperature block, not from guessing at the higher bytes.
+            decoded = str(decode_seagate_194(raw_val)[0])
+
+        item = {
+            "id": aid,
+            "name": g(entry, "name"),
+            "value": g(entry, "value"),
+            "worst": g(entry, "worst"),
+            "thresh": g(entry, "thresh"),
+            "raw": raw_val,
+            "raw_decoded": decoded,
+            "tripwire": is_trip,
+            "composite_masked": masked,
+        }
+        if is_trip:
+            base = baseline_counters.get(TRIPWIRES[aid])
+            item["baseline"] = base
+            if isinstance(raw_val, int) and isinstance(base, int):
+                item["delta"] = raw_val - base
+            else:
+                item["delta"] = None
+        out.append(item)
+    return out
+
+
+def nvme_temp_sensors(log):
+    """smartctl gives `temperature_sensors: [41, 45]`; some versions/devices use
+    `temperature_sensor_1` keys instead. Accept both, drop the zeros that mean
+    "sensor not present"."""
+    sensors = log.get("temperature_sensors")
+    if isinstance(sensors, list):
+        return [v for v in sensors if isinstance(v, int) and v > 0]
+    numbered = []
+    for key in sorted(log):
+        if key.startswith("temperature_sensor_") and isinstance(log[key], int) and log[key] > 0:
+            numbered.append(log[key])
+    return numbered
+
+
+def selftest_info(data, is_nvme):
+    if is_nvme:
+        entries = g(data, "nvme_self_test_log", "table", default=[]) or []
+        last = entries[0] if entries else None
+        # value 0 == "No self-test in progress". Only a non-zero operation is
+        # a running test; smartctl reports completion percentage separately.
+        op = g(data, "nvme_self_test_log", "current_self_test_operation", "value")
+        running = g(data, "nvme_self_test_log", "current_self_test_completion_percent") if op else None
+        return {
+            "status": g(last, "self_test_result", "string") if last else "never run",
+            "last_kind": g(last, "self_test_code", "string") if last else None,
+            "last_poh": g(last, "power_on_hours") if last else None,
+            "last_lba": None,
+            "in_progress_pct": running,
+        }
+    entries = g(data, "ata_smart_self_test_log", "extended", "table", default=None)
+    if entries is None:
+        entries = g(data, "ata_smart_self_test_log", "standard", "table", default=[]) or []
+    last = entries[0] if entries else None
+    running = g(data, "ata_smart_data", "self_test", "status", "remaining_percent")
+    return {
+        "status": g(last, "status", "string", default="never run") if last else "never run",
+        "passed": g(last, "status", "passed") if last else None,
+        "last_kind": g(last, "type", "string") if last else None,
+        "last_poh": g(last, "lifetime_hours") if last else None,
+        "last_lba": g(last, "lba"),
+        "in_progress_pct": (100 - running) if isinstance(running, int) else None,
+    }
+
+
+def normalised_values_are_populated(attributes):
+    """Does this controller actually maintain the normalised value column?
+
+    SMART's normalised value/worst/threshold triple is what "wear indicator"
+    readings are built on. Some cheap controllers never populate it: the NGFF
+    SSD in the Ugreen enclosure reports (100, 100, 50) for ALL THIRTY of its
+    attributes, including Wear_Leveling_Count. Reading 100 there as "100 % life
+    remaining" is not a measurement, it is a constant — the same false
+    confidence as calling a SCSI INQUIRY a health check, one layer subtler.
+
+    A real drive varies: the Exos reports 16 distinct triples across 22
+    attributes. So: if every attribute carries the identical triple, the column
+    is decoration and must not be used as a health percentage. Raw values are
+    unaffected — those are still real counters.
+    """
+    triples = {(a.get("value"), a.get("worst"), a.get("thresh")) for a in attributes}
+    return len(triples) > 1
+
+
+def ata_device_stat(data, page_number, name):
+    """Return one valid standardized ATA Device Statistics value.
+
+    Unlike SMART attributes, the names and units in this log are defined by
+    ACS, so they remain usable when smartctl does not know the drive model.
+    Match both page and name: names are human-readable JSON API strings, while
+    page numbers keep an accidental duplicate on another page from winning.
+    """
+    for page in g(data, "ata_device_statistics", "pages", default=[]) or []:
+        if page.get("number") != page_number:
+            continue
+        for row in page.get("table", []) or []:
+            if row.get("name") != name:
+                continue
+            if g(row, "flags", "valid") is False:
+                return None
+            value = row.get("value")
+            return value if isinstance(value, int) else None
+    return None
+
+
+def ata_error_summary(data):
+    """Summarize the cumulative ATA error log without interpreting commands."""
+    log = g(data, "ata_smart_error_log", "extended", default=None)
+    if not isinstance(log, dict):
+        log = g(data, "ata_smart_error_log", "summary", default=None)
+    if not isinstance(log, dict):
+        return None
+    count = log.get("count")
+    table = log.get("table") or []
+    last = table[0] if table and isinstance(table[0], dict) else {}
+    poh = (last.get("lifetime_hours") if isinstance(last, dict) else None)
+    if poh is None:
+        poh = g(last, "error_description", "lifetime_hours")
+    entries = []
+    for item in table[:5]:
+        if not isinstance(item, dict):
+            continue
+        description = (item.get("error_description") or item.get("description")
+                       or item.get("state"))
+        if isinstance(description, dict):
+            description = description.get("string") or description.get("name")
+        entries.append({"poh": item.get("lifetime_hours"),
+                        "lba": item.get("lba"),
+                        "description": description})
+    return {"protocol": "ATA", "count": count if isinstance(count, int) else None,
+            "last_poh": poh if isinstance(poh, int) else None,
+            "entries": entries}
+
+
+def nvme_error_summary(data, health_log):
+    meta = g(data, "nvme_error_information_log", default={}) or {}
+    table = meta.get("table") or meta.get("entries") or []
+    entries = []
+    for item in table[:5] if isinstance(table, list) else []:
+        if not isinstance(item, dict):
+            continue
+        def scalar(value, *preferred):
+            if not isinstance(value, dict):
+                return value
+            for key in preferred + ("string", "value"):
+                if value.get(key) is not None:
+                    return value[key]
+            return None
+        entries.append({
+            "error_count": item.get("error_count"),
+            "sqid": item.get("submission_queue_id", item.get("sqid")),
+            "cmdid": item.get("command_id", item.get("cmdid")),
+            "status": scalar(item.get("status_field", item.get("status")), "string"),
+            "lba": scalar(item.get("lba"), "value"),
+        })
+    count = health_log.get("num_err_log_entries")
+    return {"protocol": "NVMe", "count": count if isinstance(count, int) else None,
+            "read": meta.get("read"), "unread": meta.get("unread"),
+            "entries": entries}
+
+
+def drive_database_info(data):
+    version = g(data, "smartctl", "drive_database_version", "string")
+    candidates = ("/var/lib/smartmontools/drivedb/drivedb.h",
+                  "/usr/share/smartmontools/drivedb.h",
+                  "/usr/share/smartmontools/drivedb/drivedb.h")
+    updated_at = None
+    age_days = None
+    newest = None
+    for path in candidates:
+        try:
+            stamp = os.path.getmtime(path)
+            newest = stamp if newest is None else max(newest, stamp)
+        except OSError:
+            continue
+    if newest is not None:
+        updated_at = datetime.fromtimestamp(newest, timezone.utc).isoformat()
+        age_days = max(0, int((time.time() - newest) / 86400))
+    return {"known_model": bool(g(data, "in_smartctl_database")),
+            "version": version, "updated_at": updated_at, "age_days": age_days}
+
+
+def farm_summary(data):
+    log = None
+    for key in ("seagate_farm_log", "ata_farm_log", "scsi_farm_log"):
+        if isinstance(data.get(key), dict):
+            log = data[key]
+            break
+    if not isinstance(log, dict):
+        return None
+    if log.get("supported") is False:
+        return None
+    # Preserve scalar values under their smartctl names; no vendor-unit
+    # interpretation is attempted here.
+    values = {}
+    def visit(prefix, value, budget):
+        if budget[0] <= 0:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(f"{prefix}.{key}" if prefix else str(key), child, budget)
+        elif isinstance(value, list):
+            for index, child in enumerate(value[:8]):
+                visit(f"{prefix}[{index}]", child, budget)
+        elif isinstance(value, (str, int, float, bool)):
+            values[prefix] = value
+            budget[0] -= 1
+    # Limit each FARM page independently. A single drive-information page can
+    # be very verbose; a global cap used to hide all later reliability pages.
+    for page, value in log.items():
+        if page == "supported":
+            continue
+        visit(str(page), value, [40])
+    return {"available": True, "values": values}
+
+
+def update_trends(drive, ts):
+    """Refresh trends only from a real reading; retain cached evidence."""
+    if drive.get("source") == "smartctl":
+        drive["trends"] = history_trends(drive, ts)
+    return drive.get("trends")
+
+
+def overall_verdict(fixed):
+    worst = "good"
+    eligible = 0
+    for drive in fixed:
+        if g(drive, "health", "affects_overall", default=True) is False:
+            continue
+        eligible += 1
+        verdict = g(drive, "health", "verdict", default="unknown")
+        if _rank(verdict) > _rank(worst):
+            worst = verdict
+    return worst if eligible else "unknown"
+
+
+def hdd_health_percent(deltas):
+    """There is no vendor health counter for a spinning disk, so this is a
+    DOCUMENTED HEURISTIC, not a measurement — the UI must say so. Start at 100
+    and subtract a weighted penalty per counter that has moved off baseline."""
+    weights = {
+        "Reallocated_Sector_Ct": 10,
+        "Reported_Uncorrect": 10,
+        "Command_Timeout": 3,
+        "Offline_Uncorrectable": 10,
+        "Current_Pending_Sector": 5,
+        "UDMA_CRC_Error_Count": 2,
+    }
+    pct = 100
+    for name, weight in weights.items():
+        d = deltas.get(name)
+        if isinstance(d, int) and d > 0:
+            pct -= min(50, weight * max(1, d))
+    return max(0, pct)
+
+
+def build_drive(dev, byid, data, note, cfg, baselines, prev_drive):
+    serial = dev["serial"]
+    is_nvme = smartctl_is_nvme(data, dev["tran"] == "nvme")
+    is_scsi = smartctl_is_scsi(data) and not is_nvme
+    thresholds = cfg["thresholds"]
+    base_entry = baselines.get("drives", {}).get(serial, {})
+    base_counters = base_entry.get("counters", {}) or {}
+
+    drive = {
+        # Full schema, always. A missing key is a crash in whatever reads this;
+        # an explicit null is a state the UI can render.
+        "firmware": None, "standard": None, "transfer_mode": None,
+        "rotation_rpm": None, "features": {}, "power_state": "unknown",
+        "power_on_hours": None, "power_on_pretty": None, "poh_baseline": None,
+        "power_cycles": None, "host_reads_bytes": None, "host_writes_bytes": None,
+        "endurance": None, "temperature": {"c": None, "min_c": None, "max_c": None,
+                                           "minmax_scope": None, "warn_at": None},
+        "selftest": {"status": "unknown", "last_kind": None, "last_poh": None,
+                     "last_lba": None, "in_progress_pct": None},
+        "serial": serial,
+        "disk_serial": smartctl_disk_serial(data),
+        "enclosure_serial": dev.get("enclosure_serial"),
+        "identity_wwn": dev.get("wwn") or None,
+        "history_id": safe_history_id(serial),
+        "name": configured_for(cfg, "names", serial) or derive_name(dev),
+        # No derived "role". CrystalDiskInfo describes the drive, not what the
+        # OS does with it, and its one nod to system layout is Drive Letter —
+        # which is the mount list below. Inventing a role duplicated that line
+        # and guessed at meaning the disk never reported. `note` is whatever
+        # the owner chose to write, and nothing when they wrote nothing.
+        "note": configured_for(cfg, "notes", serial),
+        "removable": is_removable(dev, cfg),
+        "present": True,
+        "device": f"/dev/{dev['name']}",
+        "by_id": byid,
+        "type": "nvme" if is_nvme else ("hdd" if dev["rota"] else "ssd"),
+        "kind": None,          # filled in below, once smartctl data is in hand
+        "title": None,
+        "form_factor": None,
+        "model": dev["model"] or None,
+        "capacity_bytes": dev["size"],
+        "interface": interface_string(dev["name"], dev["tran"]),
+        "mounts": dev["mounts"],
+        # From the kernel, not from SMART, so it is filled in even for a drive
+        # whose SMART cannot be read at all.
+        "filesystems": filesystem_usage(dev["mounts"]),
+        "source": "none",
+        "health_since": None,
+        "data_stale_since": None,
+        "read_at": None,
+        "probe_ms": None,
+        "probe": None,
+        "error_log": None,
+        "trends": None,
+        "drive_database": None,
+        "farm": None,
+        "smart_capability": "unknown",
+        "nvme": None,
+        "mmc": None,
+        "scsi": None,
+        "attributes": [],
+    }
+
+    reasons = []
+    # A device we cannot read still gets a heading: transport and size are
+    # known from the kernel even when SMART is not.
+    drive["kind"] = configured_for(cfg, "kinds", serial) or derive_kind(dev, data)
+    drive["title"] = derive_title(dev, drive["kind"], drive["capacity_bytes"])
+    drive["temperature"]["warn_at"] = (thresholds["nvme_temp_warn"] if is_nvme
+                                       else thresholds["hdd_temp_warn"] if dev["rota"]
+                                       else thresholds["ssd_temp_warn"])
+
+    # --- no readable data: unknown, never good ------------------------------
+    if data is None:
+        drive["source"] = "none"
+        drive["smart_capability"] = ("unavailable" if note and "no SMART" in note
+                                     else "unknown")
+        drive["health"] = {"verdict": "unknown", "percent": None,
+                           "percent_is_derived": True, "percent_basis": None,
+                           "reasons": [note or "no SMART data"]}
+        drive["power_state"] = "unknown"
+        if prev_has_data(prev_drive):
+            # Carry forward what we knew, clearly marked stale.
+            for key in ("model", "firmware", "power_on_hours", "power_cycles",
+                        "temperature", "host_reads_bytes", "host_writes_bytes",
+                        "endurance", "selftest", "attributes", "nvme", "scsi",
+                        "disk_serial", "read_at", "error_log", "drive_database",
+                        "farm", "trends", "smart_capability", "kind", "title", "form_factor",
+                        "type"):
+                if prev_drive.get(key) is not None:
+                    drive[key] = prev_drive[key]
+            # Measurements may be cached; policy must reflect today's device
+            # classification and configuration, not the previous run's rules.
+            drive["temperature"]["warn_at"] = (
+                thresholds["nvme_temp_warn"] if is_nvme
+                else thresholds["hdd_temp_warn"] if dev["rota"]
+                else thresholds["ssd_temp_warn"])
+            drive["source"] = "cached"
+            drive["data_stale_since"] = prev_drive.get("data_stale_since") or prev_drive.get("_collected_at") or now_iso()
+        return drive
+
+    # --- standby: skipped on purpose, not a failure -------------------------
+    messages = " ".join(str(g(m, "string", default="")) for m in (g(data, "smartctl", "messages", default=[]) or []))
+
+    # smartctl exits 2 both for "drive is asleep, skipped" and for "could not
+    # open the device". Those mean opposite things — one is fine, the other is
+    # a blind spot — so key off the message, never the exit code.
+    #
+    # Match the real sentence, not the bare word: smartctl's own USAGE text
+    # ("VALID ARGUMENTS ARE: never, sleep, standby, idle") contains "standby",
+    # so a substring test reports an unreadable drive as merely asleep — which
+    # is exactly the silent blind spot this project exists to prevent.
+    asleep = is_standby_response(data)
+
+    if not has_smart_evidence(data) and not asleep:
+        drive["source"] = "none"
+        drive["smart_capability"] = "unavailable"
+        drive["power_state"] = "unknown"
+        problem = messages.strip() or note or f"smartctl returned no device data (exit {g(data, 'smartctl', 'exit_status')})"
+        drive["health"] = {"verdict": "unknown", "percent": None,
+                           "percent_is_derived": True,
+                           "percent_basis": None,
+                           "reasons": [problem[:300]]}
+        log_line(f"collector\t{serial}: unreadable — {problem[:200]}")
+        if prev_has_data(prev_drive):
+            for key in ("model", "firmware", "power_on_hours", "power_cycles",
+                        "temperature", "host_reads_bytes", "host_writes_bytes",
+                        "endurance", "selftest", "attributes", "nvme", "scsi",
+                        "disk_serial", "read_at", "error_log", "drive_database",
+                        "farm", "trends", "smart_capability", "kind", "title", "form_factor",
+                        "type"):
+                if prev_drive.get(key) is not None:
+                    drive[key] = prev_drive[key]
+            drive["source"] = "cached"
+            drive["data_stale_since"] = (prev_drive.get("data_stale_since")
+                                          or prev_drive.get("_collected_at") or now_iso())
+        return drive
+
+    if asleep:
+        drive["smart_capability"] = "standby"
+        drive["power_state"] = power_mode_name(data, "standby")
+        drive["source"] = "cached"
+        if prev_has_data(prev_drive):
+            for key in ("model", "firmware", "power_on_hours", "power_cycles",
+                        "temperature", "host_reads_bytes", "host_writes_bytes",
+                        "endurance", "selftest", "attributes", "nvme", "scsi",
+                        "disk_serial", "read_at", "error_log", "drive_database",
+                        "farm", "trends", "smart_capability", "kind", "title", "form_factor",
+                        "type", "health"):
+                if prev_drive.get(key) is not None:
+                    drive[key] = prev_drive[key]
+            drive["smart_capability"] = "standby"
+            drive["data_stale_since"] = (prev_drive.get("data_stale_since")
+                                          or prev_drive.get("_collected_at") or now_iso())
+            drive["health"] = dict(prev_drive.get("health") or {})
+            drive["health"].setdefault("reasons", [])
+            carried = "drive in standby; values carried forward"
+            drive["health"]["reasons"] = [r for r in drive["health"]["reasons"]
+                                            if r != carried] + [carried]
+            return drive
+        drive["source"] = "none"
+        drive["health"] = {"verdict": "unknown", "percent": None,
+                           "percent_is_derived": True,
+                           "percent_basis": None,
+                           "reasons": ["drive in standby and no previous reading"]}
+        return drive
+
+    drive["source"] = "sysfs" if g(data, "mmc_health", default=None) else "smartctl"
+    drive["smart_capability"] = "available"
+    drive["power_state"] = power_mode_name(data, "active")
+    drive["model"] = g(data, "model_name") or drive["model"]
+    drive["firmware"] = g(data, "firmware_version")
+    drive["capacity_bytes"] = g(data, "user_capacity", "bytes") or drive["capacity_bytes"]
+    # 0 rpm is what a solid-state drive reports, and the renderers say "solid
+    # state" when they see it. Coercing it to None threw that away and left
+    # the row blank instead.
+    drive["rotation_rpm"] = g(data, "rotation_rate")
+    # smartctl only knows an attribute's real units if it knows the drive. For
+    # anything not in its database the vendor-specific fields are guesses.
+    drive["in_smartctl_database"] = bool(g(data, "in_smartctl_database"))
+    drive["drive_database"] = drive_database_info(data)
+    drive["farm"] = farm_summary(data)
+    drive["model_family"] = g(data, "model_family")
+    nvme_std = g(data, "nvme_version", "string")
+    ata_std = g(data, "ata_version", "string")
+    if isinstance(ata_std, str):
+        # "ACS-4 (minor revision not indicated)" — the parenthetical carries no
+        # information and wraps the card's header line.
+        ata_std = re.sub(r"\s*\((?:minor revision not indicated|unknown minor revision[^)]*)\)",
+                         "", ata_std).strip()
+    drive["standard"] = ata_std or (f"NVMe {nvme_std}" if nvme_std else None)
+    cur_if = g(data, "interface_speed", "current", "string")
+    max_if = g(data, "interface_speed", "max", "string")
+    drive["transfer_mode"] = f"{cur_if} | {max_if}" if cur_if and max_if else (cur_if or max_if)
+    if drive["transfer_mode"] is None and is_nvme:
+        drive["transfer_mode"] = nvme_transfer_mode(dev["name"])
+    drive["features"] = {
+        "smart": bool(g(data, "smart_support", "enabled", default=g(data, "smart_status", "passed") is not None)),
+        "apm": g(data, "ata_apm", "enabled"),
+        "aam": g(data, "ata_aam", "enabled"),
+        "trim": g(data, "trim", "supported"),
+        "write_cache": g(data, "write_cache", "enabled"),
+    }
+
+    drive["form_factor"] = g(data, "form_factor", "name")
+    drive["kind"] = configured_for(cfg, "kinds", serial) or derive_kind(dev, data)
+    drive["title"] = derive_title(dev, drive["kind"], drive["capacity_bytes"])
+
+    drive["power_on_hours"] = g(data, "power_on_time", "hours")
+    if drive["power_on_hours"] is None:
+        drive["power_on_hours"] = g(data, "nvme_smart_health_information_log", "power_on_hours")
+    drive["power_on_pretty"] = pretty_hours(drive["power_on_hours"])
+    drive["poh_baseline"] = base_entry.get("poh")
+    drive["power_cycles"] = g(data, "power_cycle_count")
+    if drive["power_cycles"] is None:
+        drive["power_cycles"] = g(data, "nvme_smart_health_information_log", "power_cycles")
+
+    temp_c = g(data, "temperature", "current")
+    if temp_c == 0:
+        temp_c = None                       # empty SCSI response, not 0 °C
+    # smartctl reports min/max over two different spans and not every drive
+    # carries both, so the SCOPE travels with the numbers. Labelling a
+    # power-cycle range "lifetime" is the same overclaim as calling a SCSI
+    # INQUIRY a health check, one field smaller.
+    life_min = g(data, "temperature", "lifetime_min")
+    life_max = g(data, "temperature", "lifetime_max")
+    cycle_min = g(data, "temperature", "power_cycle_min")
+    cycle_max = g(data, "temperature", "power_cycle_max")
+    if life_min is not None or life_max is not None:
+        min_c, max_c, minmax_scope = life_min, life_max, "lifetime"
+    elif cycle_min is not None or cycle_max is not None:
+        min_c, max_c, minmax_scope = cycle_min, cycle_max, "this power cycle"
+    else:
+        min_c = max_c = minmax_scope = None
+    drive["temperature"] = {
+        "c": temp_c,
+        "min_c": min_c,
+        "max_c": max_c,
+        "minmax_scope": minmax_scope,
+        "warn_at": (thresholds["nvme_temp_warn"] if is_nvme
+                    else thresholds["hdd_temp_warn"] if dev["rota"]
+                    else thresholds["ssd_temp_warn"]),
+    }
+
+    limit_max = g(data, "temperature", "limit_max", default=g(data, "temperature", "op_limit_max"))
+    over = g(data, "temperature", "lifetime_over_limit_minutes")
+    if limit_max is not None:
+        drive["temperature"]["limit_max"] = limit_max
+    if over is not None:
+        drive["temperature"]["over_limit_minutes"] = over
+
+    drive["selftest"] = selftest_info(data, is_nvme)
+
+    # --- health ------------------------------------------------------------
+    verdict = "good"
+    smart_passed = g(data, "smart_status", "passed")
+    if smart_passed is False:
+        verdict = "bad"
+        reasons.append("SMART overall-health self-assessment FAILED")
+
+    mmc = g(data, "mmc_health", default=None)
+    if mmc:
+        used = mmc.get("percentage_used_upper_bound")
+        pre_eol = mmc.get("pre_eol")
+        drive["type"] = "mmc"
+        drive["mmc"] = mmc
+        pct = max(0, 100 - used) if isinstance(used, int) else None
+        if pre_eol == 3:
+            verdict = "bad"
+            reasons.append("eMMC pre-EOL status is urgent")
+        elif pre_eol == 2 or (isinstance(pct, int) and pct < thresholds["wear_warn_pct"]):
+            verdict = "caution" if verdict == "good" else verdict
+            reasons.append("eMMC lifetime register indicates advanced wear")
+        drive["health"] = {"verdict": verdict, "percent": pct,
+                           "percent_is_derived": False,
+                           "percent_basis": "jedec_mmc_lifetime_upper_bound",
+                           "reasons": reasons}
+    elif is_nvme:
+        log = g(data, "nvme_smart_health_information_log", default={}) or {}
+        used = log.get("percentage_used")
+        spare = log.get("available_spare")
+        spare_thresh = log.get("available_spare_threshold")
+        media_errors = log.get("media_errors")
+        crit = log.get("critical_warning")
+        drive["nvme"] = {
+            "percentage_used": used,
+            "available_spare": spare,
+            "spare_threshold": spare_thresh,
+            "critical_warning": crit,
+            "media_errors": media_errors,
+            "num_err_log_entries": log.get("num_err_log_entries"),
+            "unsafe_shutdowns": log.get("unsafe_shutdowns"),
+            "temp_sensors_c": nvme_temp_sensors(log),
+        }
+        drive["error_log"] = nvme_error_summary(data, log)
+        error_count = drive["error_log"].get("count")
+        error_base = base_entry.get("nvme_error_count")
+        if isinstance(error_count, int):
+            drive["error_log"]["baseline"] = error_base
+            drive["error_log"]["delta"] = (error_count - error_base
+                                                   if isinstance(error_base, int) else None)
+        pct = max(0, min(100, 100 - used)) if isinstance(used, int) else None
+        drive["health"] = {"verdict": verdict, "percent": pct,
+                           "percent_is_derived": False,
+                           "percent_basis": "nvme_percentage_used",
+                           "reasons": reasons}
+        if crit:
+            verdict = "bad"
+            reasons.append(f"NVMe critical_warning = {crit}")
+        if isinstance(media_errors, int) and media_errors > 0:
+            verdict = "bad"
+            reasons.append(f"media_errors = {media_errors}")
+        if (isinstance(error_count, int) and isinstance(error_base, int)
+                and error_count > error_base):
+            verdict = "caution" if verdict == "good" else verdict
+            reasons.append(f"NVMe error log grew by {error_count - error_base} "
+                           f"(baseline {error_base}, now {error_count})")
+        if isinstance(spare, int) and isinstance(spare_thresh, int) and spare < spare_thresh:
+            verdict = "bad"
+            reasons.append(f"available_spare {spare}% below threshold {spare_thresh}%")
+        elif isinstance(pct, int) and pct < thresholds["wear_warn_pct"]:
+            verdict = "caution" if verdict == "good" else verdict
+            reasons.append(f"wear: {pct}% life remaining")
+
+        written = log.get("data_units_written")
+        read = log.get("data_units_read")
+        drive["host_writes_bytes"] = written * 512000 if isinstance(written, int) else None
+        drive["host_reads_bytes"] = read * 512000 if isinstance(read, int) else None
+        rated = configured_for(cfg, "endurance", serial)
+        if rated and drive["host_writes_bytes"]:
+            tb = drive["host_writes_bytes"] / 1e12
+            drive["endurance"] = {"rated_tbw": rated, "written_tb": round(tb, 1),
+                                  "used_pct": round(tb / rated * 100, 1)}
+        else:
+            drive["endurance"] = None
+        drive["health"]["percent"] = pct
+    elif is_scsi:
+        grown = g(data, "scsi_grown_defect_list")
+        error_log = g(data, "scsi_error_counter_log", default={}) or {}
+        uncorrected = {}
+        for operation in ("read", "write", "verify"):
+            value = g(error_log, operation, "total_uncorrected_errors")
+            if isinstance(value, int):
+                uncorrected[operation] = value
+        used = g(data, "scsi_percentage_used_endurance_indicator")
+        if isinstance(used, dict):
+            used = used.get("value")
+        pct = max(0, 100 - used) if isinstance(used, int) else None
+        drive["scsi"] = {
+            "grown_defects": grown if isinstance(grown, int) else None,
+            "uncorrected_errors": uncorrected,
+            "percentage_used": used if isinstance(used, int) else None,
+        }
+        base_scsi = base_entry.get("scsi", {}) or {}
+        for label, value in (("grown defects", drive["scsi"]["grown_defects"]),
+                             *((f"uncorrected {op}", value)
+                               for op, value in uncorrected.items())):
+            baseline = base_scsi.get(label)
+            if isinstance(value, int) and isinstance(baseline, int) and value > baseline:
+                verdict = "bad"
+                reasons.append(f"SCSI {label} = {value} (baseline {baseline}, +{value - baseline})")
+        if isinstance(pct, int) and pct < thresholds["wear_warn_pct"]:
+            verdict = "caution" if verdict == "good" else verdict
+            reasons.append(f"wear: {pct}% life remaining (scsi_percentage_used)")
+        has_scsi_metrics = (isinstance(grown, int) or bool(uncorrected)
+                            or isinstance(used, int))
+        if not has_scsi_metrics and smart_passed is not False:
+            verdict = "unknown"
+            reasons.append("SCSI device exposes no defect, error-counter or endurance log")
+        drive["health"] = {
+            "verdict": verdict,
+            "percent": pct,
+            "percent_is_derived": False,
+            "percent_basis": "scsi_percentage_used" if isinstance(used, int) else None,
+            "reasons": reasons,
+        }
+    else:
+        seagate = is_seagate_ata(data)
+        drive["attributes"] = build_attributes(data, base_counters, seagate=seagate)
+        by_id_attr = {a["id"]: a for a in drive["attributes"]}
+        drive["error_log"] = ata_error_summary(data)
+        if drive["error_log"] and isinstance(drive["error_log"].get("count"), int):
+            error_count = drive["error_log"]["count"]
+            error_base = base_entry.get("ata_error_count")
+            drive["error_log"]["baseline"] = error_base
+            drive["error_log"]["delta"] = (error_count - error_base
+                                             if isinstance(error_base, int) else None)
+            if isinstance(error_base, int) and error_count > error_base:
+                if verdict == "good":
+                    verdict = "caution"
+                reasons.append(f"ATA error log count = {error_count} "
+                               f"(baseline {error_base}, +{error_count - error_base})")
+
+        # A drive nobody has baselined yet is being adopted on THIS read:
+        # capture_baseline() records these very numbers a moment from now. The
+        # rule is "compare against the baseline, not against zero", and on the
+        # adopting run the baseline IS what the drive currently reads —
+        # otherwise every ex-farm disk is condemned by the run that accepts it.
+        if serial not in (baselines.get("drives") or {}):
+            adopted = False
+            for aid in TRIPWIRES:
+                attr = by_id_attr.get(aid)
+                if attr and isinstance(attr.get("raw"), int):
+                    attr["baseline"] = attr["raw"]
+                    attr["delta"] = 0
+                    adopted = adopted or attr["raw"] > 0
+            if adopted:
+                reasons.append("first read: this drive's current counters are being "
+                               "accepted as its baseline")
+
+        deltas = {}
+        for aid, name in TRIPWIRES.items():
+            attr = by_id_attr.get(aid)
+            if not attr:
+                continue
+            raw = attr.get("raw")
+            if not isinstance(raw, int):
+                continue
+            # The card and the verdict must never disagree about what the
+            # baseline was, so both read it from the same place.
+            base = attr.get("baseline")
+            # A newly-supported counter is absent from older acceptance files.
+            # Adopt its current value; comparing it to zero would condemn an
+            # existing drive during a software upgrade rather than a change.
+            if not isinstance(base, int):
+                base = raw
+                attr["baseline"] = raw
+                attr["delta"] = 0
+            delta = raw - base
+            deltas[name] = delta
+            if delta > 0:
+                if aid in TRIPWIRE_BAD:
+                    verdict = "bad"
+                elif verdict == "good":
+                    verdict = "caution"
+                detail = f"{name} = {raw} (baseline {base}, +{delta})"
+                if aid == 199:
+                    detail += "; interface errors usually indicate the cable, connector or enclosure, not disk media"
+                reasons.append(detail)
+
+        # attr 194 min/max when smartctl's SCT block did not supply them
+        attr194 = by_id_attr.get(194)
+        if (seagate and attr194 and drive["temperature"]["c"] is None
+                and isinstance(attr194.get("raw"), int)):
+            cur, (lo, hi) = decode_seagate_194(attr194["raw"])
+            drive["temperature"]["c"] = cur
+            if drive["temperature"]["min_c"] is None and drive["temperature"]["max_c"] is None:
+                # Unpacked from attribute 194's higher bytes — neither smartctl
+                # nor the drive says what span they cover, so say that.
+                drive["temperature"]["min_c"] = lo
+                drive["temperature"]["max_c"] = hi
+                if lo is not None or hi is not None:
+                    drive["temperature"]["minmax_scope"] = "attribute 194"
+
+        # Prefer ACS-standard Device Statistics. These counters are logical
+        # sectors, so their unit is the drive's declared logical block size and
+        # does not depend on smartctl recognizing the model.
+        sector = g(data, "logical_block_size") or 512
+        stat_written = ata_device_stat(data, 1, "Logical Sectors Written")
+        stat_read = ata_device_stat(data, 1, "Logical Sectors Read")
+        drive["host_writes_bytes"] = (stat_written * sector
+                                      if isinstance(stat_written, int) else None)
+        drive["host_reads_bytes"] = (stat_read * sector
+                                     if isinstance(stat_read, int) else None)
+
+        # Attributes 241/242 are named "Total_LBAs_*" but the unit is vendor
+        # specific — some controllers count 512-byte LBAs, others 32 MiB
+        # chunks or whole gigabytes. smartctl only knows which when the drive
+        # is in its database. For the Exos it is, and 44.6 TB checks out; for
+        # the unknown SSD it is not, and the naive reading gave "33.7 MB
+        # written" for a drive with 865 hours on it. Report nothing rather
+        # than a number that is wrong by a factor of 64.
+        attr241 = by_id_attr.get(241, {})
+        attr242 = by_id_attr.get(242, {})
+        lbaw = attr241.get("raw") if attr241.get("name") == "Total_LBAs_Written" else None
+        lbar = attr242.get("raw") if attr242.get("name") == "Total_LBAs_Read" else None
+        if drive["host_writes_bytes"] is None and drive["host_reads_bytes"] is None:
+            if drive["in_smartctl_database"]:
+                drive["host_writes_bytes"] = lbaw * sector if isinstance(lbaw, int) else None
+                drive["host_reads_bytes"] = lbar * sector if isinstance(lbar, int) else None
+            elif isinstance(lbaw, int) or isinstance(lbar, int):
+                reasons.append("host read/write totals withheld: this model is not in "
+                               "smartctl's database, so the units of attributes 241/242 "
+                               "are unverified")
+        drive["endurance"] = None
+        # A SATA SSD is not a spinning disk: it has a real wear indicator, so
+        # use it instead of inferring health from "no tripwire has fired yet".
+        wear_pct, wear_basis = None, None
+        used_endurance = ata_device_stat(
+            data, 7, "Percentage Used Endurance Indicator")
+        if isinstance(used_endurance, int) and used_endurance >= 0:
+            wear_pct = max(0, 100 - used_endurance)
+            wear_basis = "ata_device_statistics_percentage_used"
+        normalised_ok = normalised_values_are_populated(drive["attributes"])
+        if drive["attributes"] and not normalised_ok and wear_pct is None:
+            reasons.append("this controller reports an identical normalised value for every "
+                           "attribute, so its wear indicator is a constant, not a reading")
+        if not dev["rota"] and normalised_ok and wear_pct is None:
+            for aid, label in SSD_WEAR_ATTRS:
+                attr = by_id_attr.get(aid)
+                if (attr and attr.get("name") == label
+                        and isinstance(attr.get("value"), int)):
+                    wear_pct, wear_basis = attr["value"], f"ata_attribute_{aid}_{label}"
+                    break
+        if wear_pct is not None and wear_pct < thresholds["wear_warn_pct"]:
+            verdict = "caution" if verdict == "good" else verdict
+            reasons.append(f"wear: {wear_pct}% life remaining ({wear_basis})")
+
+        # No attribute table means nothing to derive a percentage FROM. 100 %
+        # would be a claim we cannot support; null renders as "—".
+        has_attrs = bool(drive["attributes"])
+        if not has_attrs:
+            # Some USB bridges answer the overall health question and nothing
+            # else. "Not failing" is worth showing, but it is not a basis for
+            # calling a drive healthy: no wear, no error counters, no hours.
+            if smart_passed:
+                reasons.append("device reports SMART health: passed, but exposes no "
+                               "attributes, power-on hours or temperature")
+            else:
+                reasons.append("no SMART attributes returned by this device")
+            if verdict == "good":
+                verdict = "unknown"
+        if wear_pct is not None:
+            pct, derived, basis = wear_pct, False, wear_basis
+        elif has_attrs and dev["rota"]:
+            pct, derived, basis = hdd_health_percent(deltas), True, "hdd_tripwire_heuristic"
+        else:
+            # A non-rotating drive with no wear counter: the tripwires may all
+            # be clean, but there is no number behind a percentage.
+            pct, derived, basis = None, True, None
+        drive["health"] = {"verdict": verdict, "percent": pct,
+                           "percent_is_derived": derived,
+                           "percent_basis": basis,
+                           "reasons": reasons}
+
+    st = drive["selftest"]
+    if st.get("passed") is False or (isinstance(st.get("status"), str) and "fail" in st["status"].lower()):
+        verdict = "bad"
+        reasons.append(f"last self-test: {st.get('status')}")
+
+    evaluated_temp = drive["temperature"].get("c")
+    warn_at = drive["temperature"]["warn_at"]
+    previous_temp_alert = any(
+        isinstance(r, str) and r.startswith("temperature ")
+        for r in g(prev_drive, "health", "reasons", default=[]) or [])
+    temp_alert = (isinstance(evaluated_temp, int)
+                  and (evaluated_temp >= warn_at
+                       or (previous_temp_alert and evaluated_temp >= warn_at - 3)))
+    if temp_alert:
+        if verdict == "good":
+            verdict = "caution"
+        if evaluated_temp >= warn_at:
+            reasons.append(f"temperature {evaluated_temp} °C at or above {warn_at} °C")
+        else:
+            reasons.append(f"temperature {evaluated_temp} °C awaiting recovery below {warn_at - 3} °C")
+
+    drive["health"]["verdict"] = verdict
+    drive["health"]["reasons"] = reasons
+    return drive
+
+
+# --------------------------------------------------------------------------- #
+# history, baselines, transitions
+# --------------------------------------------------------------------------- #
+
+HISTORY_COLUMNS = ("ts,temp_c,poh,realloc,pending,offline_uncorr,crc,"
+                   "percent_used,unsafe_shutdowns,media_errors,host_writes_bytes,"
+                   "reported_uncorrectable,command_timeout")
+
+HISTORY_TREND_FIELDS = {
+    "temperature_c": 1, "reallocated": 3, "pending": 4,
+    "offline_uncorrectable": 5, "crc": 6, "percentage_used": 7,
+    "reported_uncorrectable": 11, "command_timeout": 12,
+}
+
+
+def history_trends(drive, ts):
+    """7/30-day deltas from the append-only history, including this reading."""
+    if drive.get("source") != "smartctl":
+        return None
+    path = os.path.join(STATE_DIR, "history", f"{drive['history_id']}.csv")
+    rows = []
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            for row in csv.reader(fh):
+                if row and row[0] != "ts" and len(row) >= 11:
+                    row += [""] * (13 - len(row))
+                    rows.append(row)
+    except OSError:
+        pass
+    attrs = {a.get("id"): a.get("raw") for a in drive.get("attributes") or []}
+    nvme = drive.get("nvme") or {}
+    current = [ts, g(drive, "temperature", "c"), drive.get("power_on_hours"),
+               attrs.get(5), attrs.get(197), attrs.get(198), attrs.get(199),
+               nvme.get("percentage_used"), nvme.get("unsafe_shutdowns"),
+               nvme.get("media_errors"), drive.get("host_writes_bytes"),
+               attrs.get(187), attrs.get(188)]
+    rows.append(["" if value is None else str(value) for value in current])
+    try:
+        end = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+    def number(value):
+        try:
+            return float(value) if value != "" else None
+        except (TypeError, ValueError):
+            return None
+
+    result = {}
+    for days in (7, 30):
+        cutoff = end.timestamp() - days * 86400
+        eligible = []
+        for row in rows:
+            try:
+                stamp = datetime.fromisoformat(row[0]).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if stamp >= cutoff:
+                eligible.append(row)
+        if len(eligible) < 2:
+            continue
+        deltas = {}
+        for label, index in HISTORY_TREND_FIELDS.items():
+            values = [number(row[index]) for row in eligible]
+            if label == "temperature_c":
+                values = [None if value == 0 else value for value in values]
+            values = [value for value in values if value is not None]
+            if len(values) >= 2:
+                delta = values[-1] - values[0]
+                if delta != 0:
+                    deltas[label] = round(delta, 2)
+        span = (datetime.fromisoformat(eligible[-1][0]).timestamp()
+                - datetime.fromisoformat(eligible[0][0]).timestamp()) / 86400
+        result[f"days_{days}"] = {"span_days": round(span, 2), "deltas": deltas}
+    return result or None
+
+
+def append_history(drive, ts):
+    """One row per run per drive. CSV, not SQLite: append-only, greppable, and
+    no locking across the root-writer / user-reader boundary. ~1.6 MB a year."""
+    if drive["source"] != "smartctl":
+        return                                   # never fabricate a history row
+    serial = drive["serial"]
+    # Accept records produced by an older collector during a rolling upgrade.
+    history_id = drive.get("history_id") or safe_history_id(serial)
+    path = os.path.join(STATE_DIR, "history", f"{history_id}.csv")
+    attrs = {a["id"]: a.get("raw") for a in drive.get("attributes") or []}
+    nvme = drive.get("nvme") or {}
+    row = [
+        ts,
+        drive.get("temperature", {}).get("c"),
+        drive.get("power_on_hours"),
+        attrs.get(5), attrs.get(197), attrs.get(198), attrs.get(199),
+        nvme.get("percentage_used"),
+        nvme.get("unsafe_shutdowns"),
+        nvme.get("media_errors"),
+        drive.get("host_writes_bytes"),
+        attrs.get(187), attrs.get(188),
+    ]
+    # A row whose every field is empty records only that the collector ran —
+    # it says nothing about the drive, and it would draw as a gap in every
+    # graph while still inflating the sample count. Don't write it.
+    if all(v is None for v in row[1:]):
+        return
+    line = ",".join("" if v is None else str(v) for v in row)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        if not new:
+            with open(path, encoding="utf-8") as existing:
+                lines = existing.read().splitlines()
+            if lines and lines[0] != HISTORY_COLUMNS:
+                # Schema v1 ended at host_writes_bytes. Extend it in place so
+                # old samples remain valid and new 187/188 values align.
+                if lines[0].endswith("host_writes_bytes"):
+                    migrated = [HISTORY_COLUMNS]
+                    migrated += [line + ",," for line in lines[1:]]
+                    migrate_tmp = path + ".migrate.tmp"
+                    with open(migrate_tmp, "w", encoding="utf-8") as out:
+                        out.write("\n".join(migrated) + "\n")
+                        out.flush()
+                        os.fsync(out.fileno())
+                    os.replace(migrate_tmp, path)
+                    chown_owner(path)
+        with open(path, "a", encoding="utf-8") as fh:
+            if new:
+                fh.write(HISTORY_COLUMNS + "\n")
+            fh.write(line + "\n")
+        if new:
+            chown_owner(path)
+    except OSError as exc:
+        log_line(f"collector\thistory write failed for {serial}: {exc}")
+
+
+def capture_baseline(drive, baselines, ts):
+    """A drive we have never seen gets its baseline captured on the first good
+    read. Existing baselines are never overwritten — they are the acceptance
+    record, and silently re-baselining a degrading drive would hide the fault."""
+    serial = drive["serial"]
+    drives = baselines.setdefault("drives", {})
+    if serial in drives or drive["source"] != "smartctl":
+        return False
+    if drive.get("power_on_hours") is None and not (drive.get("attributes") or drive.get("nvme")
+                                                     or drive.get("scsi")):
+        return False          # nothing worth recording as an acceptance baseline
+    counters = {}
+    for a in drive.get("attributes") or []:
+        if a["id"] in TRIPWIRES and isinstance(a.get("raw"), int):
+            counters[TRIPWIRES[a["id"]]] = a["raw"]
+    drives[serial] = {
+        "captured_at": ts,
+        "source": "captured by disk-health-collect on first successful read",
+        "poh": drive.get("power_on_hours"),
+        "counters": counters,
+        "disk_serial": drive.get("disk_serial"),
+        "identity_wwn": drive.get("identity_wwn"),
+        "scsi": {},
+        "ata_error_count": (g(drive, "error_log", "count")
+                            if drive.get("type") != "nvme" else None),
+        "nvme_error_count": (g(drive, "error_log", "count")
+                             if drive.get("type") == "nvme" else None),
+    }
+    scsi = drive.get("scsi") or {}
+    if isinstance(scsi.get("grown_defects"), int):
+        drives[serial]["scsi"]["grown defects"] = scsi["grown_defects"]
+    for operation, value in (scsi.get("uncorrected_errors") or {}).items():
+        if isinstance(value, int):
+            drives[serial]["scsi"][f"uncorrected {operation}"] = value
+    log_line(f"collector\tbaseline captured for {serial}: poh={drive.get('power_on_hours')} {counters}")
+    return True
+
+
+def extend_baseline(drive, baselines):
+    """Add newly-supported counters to an existing acceptance record safely."""
+    entry = (baselines.get("drives") or {}).get(drive["serial"])
+    if not entry or drive.get("source") != "smartctl":
+        return False
+    counters = entry.setdefault("counters", {})
+    changed = False
+    if not entry.get("identity_wwn") and drive.get("identity_wwn"):
+        entry["identity_wwn"] = drive["identity_wwn"]
+        changed = True
+        log_line(f"collector\tbaseline extended for {drive['serial']}: identity_wwn adopted")
+    if (drive.get("type") == "nvme" and "nvme_error_count" not in entry
+            and isinstance(g(drive, "error_log", "count"), int)):
+        entry["nvme_error_count"] = g(drive, "error_log", "count")
+        changed = True
+        log_line(f"collector\tbaseline extended for {drive['serial']}: "
+                 f"nvme_error_count={entry['nvme_error_count']}")
+    if (drive.get("type") != "nvme" and "ata_error_count" not in entry
+            and isinstance(g(drive, "error_log", "count"), int)):
+        entry["ata_error_count"] = g(drive, "error_log", "count")
+        changed = True
+        log_line(f"collector\tbaseline extended for {drive['serial']}: "
+                 f"ata_error_count={entry['ata_error_count']}")
+    scsi_base = entry.setdefault("scsi", {})
+    scsi = drive.get("scsi") or {}
+    scsi_values = {}
+    if isinstance(scsi.get("grown_defects"), int):
+        scsi_values["grown defects"] = scsi["grown_defects"]
+    for operation, value in (scsi.get("uncorrected_errors") or {}).items():
+        if isinstance(value, int):
+            scsi_values[f"uncorrected {operation}"] = value
+    for name, value in scsi_values.items():
+        if name not in scsi_base:
+            scsi_base[name] = value
+            changed = True
+            log_line(f"collector\tbaseline extended for {drive['serial']}: {name}={value}")
+    for attr in drive.get("attributes") or []:
+        name = TRIPWIRES.get(attr.get("id"))
+        raw = attr.get("raw")
+        if name and name not in counters and isinstance(raw, int):
+            counters[name] = raw
+            changed = True
+            log_line(f"collector\tbaseline extended for {drive['serial']}: {name}={raw}")
+    return changed
+
+
+def diff_events(prev_state, drives, ts, cold_start=False, ignore=()):
+    """Transitions only. A repeating alarm is an alarm people learn to ignore,
+    so a drive that is still bad produces no new event — only the change does.
+    Recoveries are first-class."""
+    prev_by_serial = {d["serial"]: d for d in (prev_state.get("drives") or [])}
+    prev_by_serial.update({d["serial"]: d for d in (prev_state.get("removable") or [])})
+    events = []
+    for drive in drives:
+        serial = drive["serial"]
+        new_v = g(drive, "health", "verdict", default="unknown")
+        old = prev_by_serial.get(serial)
+        old_v = g(old, "health", "verdict") if old else None
+
+        if old is None:
+            # On the very first run every drive is "new". Announcing four
+            # hot-plugs would fire four toasts at install time and teach the
+            # user to ignore the notifier on day one.
+            if not cold_start:
+                if drive["removable"]:
+                    size = human_size(drive.get("capacity_bytes"))
+                    smart = ("SMART: n/a" if drive["source"] == "none"
+                             else f"SMART: {g(drive, 'health', 'verdict')}")
+                    events.append(make_event(ts, serial, "hotplug_add", None, new_v,
+                                             f"🔌 {drive['name']} {size} plugged in "
+                                             f"({serial}, {smart})"))
+                else:
+                    events.append(make_event(ts, serial, "hotplug_add", None, new_v,
+                                             f"{drive['name']}: now monitored ({new_v})"))
+            continue
+        if old_v == new_v:
+            watched = ("reallocated", "reported_uncorrectable", "command_timeout",
+                       "pending", "offline_uncorrectable", "crc")
+            for days in (7, 30):
+                current_trend = g(drive, "trends", f"days_{days}", "deltas", default={}) or {}
+                previous_trend = g(old, "trends", f"days_{days}", "deltas", default={}) or {}
+                grew = {key: current_trend[key] for key in watched
+                        if isinstance(current_trend.get(key), (int, float))
+                        and current_trend[key] > previous_trend.get(key, 0)}
+                if grew:
+                    detail = ", ".join(f"{key} +{value:g}" for key, value in grew.items())
+                    events.append(make_event(ts, serial, "trend", old_v, new_v,
+                                             f"{drive['name']}: {days}-day error-counter trend grew ({detail})"))
+                    break
+            continue
+        kind = "recovery" if _rank(new_v) < _rank(old_v) else "tripwire"
+        reasons = "; ".join(g(drive, "health", "reasons", default=[]) or [])
+        if not reasons:
+            if kind != "recovery":
+                reasons = f"now {new_v}"
+            elif old_v == "unknown":
+                reasons = "readable again"
+            else:
+                reasons = "all counters back at baseline"
+        events.append(make_event(ts, serial, kind, old_v, new_v,
+                                 f"{drive['name']}: {old_v} → {new_v} ({reasons})"))
+    # drives that vanished
+    current = {d["serial"] for d in drives}
+    for serial, old in prev_by_serial.items():
+        if serial in current:
+            continue
+        if serial in ignore:
+            # Adding a serial to [ignore] makes the drive leave the state file
+            # while it is still physically plugged in. That is a configuration
+            # change, not an unplug, and announcing it as one is a lie.
+            continue
+        if old.get("removable"):
+            events.append(make_event(ts, serial, "hotplug_remove",
+                                     g(old, "health", "verdict"), None,
+                                     f"🔌 {old.get('name', serial)} unplugged"))
+        else:
+            # Not a tidy removal: one of the machine's own drives is gone.
+            events.append(make_event(ts, serial, "hotplug_remove",
+                                     g(old, "health", "verdict"), "bad",
+                                     f"{old.get('name', serial)}: FIXED DRIVE NO LONGER PRESENT"))
+    return events
+
+
+def absent_drive(prev, ts):
+    """A permanent drive that has disappeared, rendered as a present:false card.
+
+    Dropping it from the list would make a failed or unplugged drive look like
+    a drive that was never configured — the state file would go quietly from
+    four drives to three and nothing would be obviously wrong."""
+    drive = dict(prev)
+    drive["present"] = False
+    drive["source"] = "none"
+    drive["power_state"] = "absent"
+    drive["device"] = None
+    drive["mounts"] = []
+    drive["filesystems"] = []
+    drive["data_stale_since"] = (prev.get("data_stale_since")
+                                  or prev.get("_collected_at") or ts)
+    drive.pop("_collected_at", None)
+    drive["health"] = {
+        "verdict": "bad",
+        "percent": None,
+        "percent_is_derived": True,
+        "percent_basis": None,
+        "reasons": ["drive is no longer present on the bus"],
+    }
+    return drive
+
+
+def _rank(verdict):
+    return {"good": 0, "caution": 1, "unknown": 2, "bad": 3}.get(verdict, 2)
+
+
+def make_event(ts, serial, kind, frm, to, message):
+    # The id is the notifier's dedupe key, so it must distinguish two different
+    # transitions on the same drive in the same second — otherwise a good →
+    # caution → bad escalation inside one second announces only the first, and
+    # the drive going BAD passes silently.
+    stamp = re.sub(r"[^0-9]", "", ts)[:14]
+    return {"id": f"{stamp}-{serial}-{kind}-{frm or 'none'}-{to or 'none'}",
+            "at": ts, "serial": serial,
+            "kind": kind, "from": frm, "to": to, "message": message}
+
+
+def restart_smartd(reason):
+    """smartd only learns about devices when it starts, and keeps stale device
+    handles across a disconnect. The vault rule is to restart it after any
+    permanent drive reconnects.
+
+    This lives in the collector rather than in the udev rule because the
+    collector KNOWS which drives are permanent — it has the previous state.
+    The udev rule would have to match on ENV{ID_SERIAL_SHORT}, which is set by
+    an IMPORT{program} in 60-persistent-storage.rules and is therefore not
+    guaranteed to be in scope by the time a 99-* rule runs. A restart that
+    might not happen is worse than one decided somewhere it can be verified.
+    """
+    log_line(f"collector\trestarting smartd: {reason}")
+    try:
+        subprocess.run(["systemctl", "restart", "smartd.service"],
+                       capture_output=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_line(f"collector_error\tsmartd restart failed: {exc}")
+
+
+def drain_smartd_events(ts):
+    """smartd drops JSON files into state/events/ via the -M exec bridge. Fold
+    them into events[] so a smartd-detected failure and a collector-detected one
+    reach the notifier through exactly one path."""
+    out = []
+    d = os.path.join(STATE_DIR, "events")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json") or not name.startswith("smartd-"):
+            continue
+        path = os.path.join(d, name)
+        payload = load_json_file(path, None)
+        if not payload:
+            continue
+        failtype = payload.get("failtype", "Unknown")
+        if failtype == "EmailTest":
+            try:
+                os.unlink(path)                        # test noise, not a fault
+            except OSError:
+                pass
+            continue
+        out.append({
+            "id": f"smartd-{name[:-5]}",
+            "at": payload.get("ts", ts),
+            "serial": payload.get("serial", "unknown"),
+            "kind": "selftest_failed" if failtype == "SelfTest" else "tripwire",
+            "from": None, "to": "bad" if failtype in ("Health", "SelfTest") else "caution",
+            "message": f"smartd/{failtype}: {payload.get('message', '')}"[:400],
+        })
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+
+def main():
+    global LOG_WRITES_ENABLED
+    ap = argparse.ArgumentParser(description="Collect SMART state into disk-health.json")
+    ap.add_argument("--config", default=None,
+                    help="path to disk-health.toml (default: the state directory "
+                         "owner's ~/.config/omarchy/disk-health.toml)")
+    ap.add_argument("--dump-raw", metavar="DIR", help="also save each smartctl JSON here")
+    ap.add_argument("--fixtures", metavar="DIR", help="read saved smartctl JSON instead of running it")
+    ap.add_argument("--dry-run", action="store_true", help="print the state, write nothing")
+    args = ap.parse_args()
+    LOG_WRITES_ENABLED = not (args.dry_run or args.fixtures)
+
+    started = time.time()
+    run_deadline = time.monotonic() + COLLECTOR_RUN_BUDGET_SECONDS
+    ts = now_iso()
+    cfg = load_config(args.config or default_config_path())
+    ignore = set(cfg["ignore"]["serials"])
+
+    state_path = os.path.join(STATE_DIR, "disk-health.json")
+    baselines_path = os.path.join(STATE_DIR, "baselines.json")
+    prev_state = load_json_file(state_path, {})
+    baselines = load_json_file(baselines_path, {"drives": {}})
+    prev_by_serial = {d["serial"]: d for d in (prev_state.get("drives") or [])}
+    prev_by_serial.update({d["serial"]: d for d in (prev_state.get("removable") or [])})
+
+    # Consume the path trigger before any potentially wedged device call. If
+    # systemd later terminates us, PathExists cannot immediately start another
+    # doomed five-minute run. A future udev event will create a fresh trigger.
+    if not args.dry_run:
+        try:
+            os.unlink(os.path.join(STATE_DIR, "collect.trigger"))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log_line(f"collector\tcould not consume collect.trigger: {exc}")
+
+    devices = list_block_devices()
+    if devices is None:
+        # Discovery failure is not evidence that every fixed disk vanished.
+        # Preserve the last known-good state and let systemd record this run as
+        # failed so monitoring can alert on collector staleness if it persists.
+        log_line("collector_error\tdevice discovery failed; previous state preserved")
+        return 1
+
+    byid = byid_paths()
+    fixed, removable = [], []
+    collector_errors = []
+    seen_serials = set()
+    identity_events = []
+    baseline_changed = False
+    duplicate_identities = set(baselines.get("duplicate_identities") or [])
+
+    for dev in devices:
+        serial = dev["serial"]
+        if not serial:
+            if not args.dry_run:
+                log_daily(f"serialless:{dev['name']}",
+                          f"collector\t{dev['name']}: no serial reported; skipped")
+            continue
+        if serial in ignore:
+            continue
+        is_mmc = dev["name"].startswith("mmcblk")
+        path = byid.get(dev["name"]) or (f"/dev/{dev['name']}" if is_mmc else None)
+        if not path:
+            log_line(f"collector\tno /dev/disk/by-id path for {dev['name']} ({serial}); skipped")
+            continue
+        is_nvme = dev["tran"] == "nvme"
+        previous_drive = previous_drive_for(dev, path, prev_by_serial)
+        cached_transport = ((previous_drive.get("probe") or {}).get("selected")
+                            if dev["tran"] == "usb" else None)
+        if cached_transport in (None, "auto"):
+            cached_transport = None
+        probe_started = time.monotonic()
+        first_probe = cached_transport or ("nvme" if is_nvme else "auto")
+        probe_attempts = [first_probe]
+        selected_transport = None
+        guard = bool(dev["rota"])
+        drive_deadline = min(time.monotonic() + SMARTCTL_DRIVE_BUDGET_SECONDS,
+                             run_deadline)
+        def remaining_timeout():
+            return max(1, min(30, int(min(drive_deadline, run_deadline)
+                                      - time.monotonic())))
+        if is_mmc:
+            data, note = mmc_health_data(dev["name"]), None
+            selected_transport = "sysfs-jedec"
+            probe_attempts = ["sysfs-jedec"]
+            if data is None:
+                note = "no readable JEDEC eMMC lifetime registers"
+        elif time.monotonic() >= run_deadline:
+            data, note = None, "collector run deadline reached before this drive"
+        else:
+            # Spin-up protection applies to spinning disks only.
+            data, note = run_smartctl(
+                path, is_nvme and not cached_transport, args.dump_raw, args.fixtures,
+                transport=cached_transport, guard_standby=guard,
+                timeout=remaining_timeout())
+            if has_smart_evidence(data) or is_standby_response(data):
+                selected_transport = probe_attempts[0]
+        # Behind a USB bridge, auto-detect usually yields nothing usable. Try
+        # known ATA, NVMe and SCSI bridge transports before calling it n/a.
+        # A real standby response is retained: probing another protocol would
+        # turn a sleeping drive into a false "no SMART" failure.
+        if (dev["tran"] == "usb" and not has_smart_evidence(data)
+                and not is_standby_response(data)):
+            attempted = [first_probe]
+            transports = ([None] if cached_transport else []) + list(USB_SMART_TRANSPORTS)
+            for transport in transports:
+                label = transport or "auto"
+                if label in probe_attempts:
+                    continue
+                if time.monotonic() >= min(drive_deadline, run_deadline):
+                    break
+                attempted.append(label)
+                probe_attempts.append(label)
+                alt, alt_note = run_smartctl(path, False, args.dump_raw, args.fixtures,
+                                             transport=transport, guard_standby=guard,
+                                             timeout=remaining_timeout())
+                if has_smart_evidence(alt):
+                    log_line(f"collector\t{serial}: SMART readable via "
+                             f"{'auto' if transport is None else '-d ' + transport}")
+                    data, note = alt, None
+                    selected_transport = label
+                    break
+                if is_standby_response(alt):
+                    data, note = alt, alt_note
+                    selected_transport = label
+                    break
+            else:
+                note = "no SMART behind this USB bridge (tried " + ", ".join(attempted) + ")"
+                data = None
+        # FARM is a read-only Seagate diagnostic log and is not included in
+        # smartctl -x. Fetch it only after the ordinary guarded read proved the
+        # drive is awake and identified as Seagate; unsupported drives incur no
+        # extra command.
+        if (data and is_seagate_ata(data) and not is_standby_response(data)
+                and not args.fixtures and time.monotonic() < drive_deadline):
+            transport = selected_transport if selected_transport not in (None, "auto") else None
+            farm_data, _ = run_smartctl(
+                path, False, args.dump_raw, None, transport=transport,
+                guard_standby=guard, timeout=remaining_timeout(), extra_args=["-l", "farm"])
+            for farm_key in ("seagate_farm_log", "ata_farm_log", "scsi_farm_log"):
+                if isinstance(g(farm_data, farm_key, default=None), dict):
+                    data[farm_key] = farm_data[farm_key]
+                    break
+        if note:
+            if is_mmc and data is None:
+                log_daily(f"mmc-health:{serial}", f"collector\t{serial}: {note}")
+            else:
+                log_line(f"collector\t{serial}: {note}")
+        kernel_serial = serial
+        dev, disk_serial = apply_disk_identity(dev, data, prev_by_serial, path)
+        serial = dev["serial"]
+        if disk_serial and kernel_serial != disk_serial:
+            log_line(f"collector\t{dev['name']}: disk serial {disk_serial} "
+                     f"behind enclosure serial {kernel_serial}")
+        if serial in ignore:
+            continue
+        original = serial
+        if serial in duplicate_identities:
+            suffix = duplicate_suffix(dev.get("wwn"), dev.get("model"), dev.get("size"), path)
+            serial = f"{serial}@{suffix}"
+            dev = dict(dev)
+            dev["serial"] = serial
+        elif serial in seen_serials:
+            # The first discovery of a duplicate is ambiguous. Retire the
+            # shared baseline immediately and disambiguate both records with a
+            # WWN (kernel path only as a loud last resort). The already-built
+            # first record is forced unknown for this one migration run; next
+            # run both adopt independent baselines under stable keys.
+            duplicate_identities.add(original)
+            baselines["duplicate_identities"] = sorted(duplicate_identities)
+            baselines.get("drives", {}).pop(original, None)
+            first = next((d for d in fixed + removable if d["serial"] == original), None)
+            if first:
+                first_suffix = duplicate_suffix(first.get("identity_wwn"), first.get("model"),
+                                                first.get("capacity_bytes"), first.get("by_id"))
+                first["serial"] = f"{original}@{first_suffix}"
+                first["history_id"] = safe_history_id(first["serial"])
+                first["health"] = {"verdict": "unknown", "percent": None,
+                                   "percent_is_derived": True, "percent_basis": None,
+                                   "reasons": ["duplicate hardware serial detected; "
+                                               "independent baseline will be adopted next run"]}
+                seen_serials.remove(original)
+                seen_serials.add(first["serial"])
+            suffix = duplicate_suffix(dev.get("wwn"), dev.get("model"), dev.get("size"), path)
+            serial = f"{original}@{suffix}"
+            dev = dict(dev)
+            dev["serial"] = serial
+            baseline_changed = True
+            log_line(f"collector_error\tduplicate identity {original}; "
+                     f"disambiguating devices by WWN/path")
+        baseline_entry = (baselines.get("drives") or {}).get(serial) or {}
+        baseline_wwn = baseline_entry.get("identity_wwn")
+        current_wwn = dev.get("wwn") or None
+        wwn_changed = bool(baseline_wwn and current_wwn and baseline_wwn != current_wwn)
+        previous_for_build = None if wwn_changed else prev_by_serial.get(serial)
+        if wwn_changed:
+            baselines.get("drives", {}).pop(serial, None)
+            baseline_changed = True
+            log_line(f"collector_error\t{serial}: WWN changed {baseline_wwn} → {current_wwn}; "
+                     "retiring the previous baseline")
+        try:
+            drive = build_drive(dev, path, data, note, cfg, baselines,
+                                previous_for_build)
+        except Exception as exc:                       # one bad drive, not all four
+            log_line(f"collector_error\t{serial}: {type(exc).__name__}: {exc}")
+            drive = build_drive(dev, path, None,
+                                f"collector error: {type(exc).__name__}: {exc}",
+                                cfg, baselines, prev_by_serial.get(serial))
+            collector_errors.append(serial)
+        if is_mmc and data is None:
+            drive["health"]["affects_overall"] = False
+            drive["health"]["reasons"] = [
+                "this eMMC device exposes no readable JEDEC lifetime registers; "
+                "health is unavailable and excluded from the overall verdict"]
+        old_on_path = next((old for old in prev_by_serial.values()
+                            if old.get("by_id") == path), None)
+        old_disk_serial = old_on_path.get("disk_serial") if old_on_path else None
+        if disk_serial and old_disk_serial and disk_serial != old_disk_serial:
+            identity_events.append(make_event(
+                ts, serial, "identity_change", old_disk_serial, disk_serial,
+                f"{drive['name']}: disk identity changed on {path} "
+                f"({old_disk_serial} → {disk_serial}); a new baseline was adopted"))
+        elif wwn_changed:
+            identity_events.append(make_event(
+                ts, serial, "identity_change", baseline_wwn, current_wwn,
+                f"{drive['name']}: WWN changed on {path}; the previous baseline "
+                "was retired and a new one adopted"))
+        drive["probe_ms"] = int((time.monotonic() - probe_started) * 1000)
+        drive["probe"] = {"selected": selected_transport,
+                          "attempts": probe_attempts}
+        if drive["source"] in ("smartctl", "sysfs"):
+            drive["read_at"] = ts
+        update_trends(drive, ts)
+        previous_record = prev_by_serial.get(serial) or {}
+        if (g(previous_record, "health", "verdict")
+                == g(drive, "health", "verdict")):
+            drive["health_since"] = (previous_record.get("health_since")
+                                      or previous_record.get("_collected_at")
+                                      or prev_state.get("collected_at") or ts)
+        else:
+            drive["health_since"] = ts
+        drive["_collected_at"] = ts
+        if capture_baseline(drive, baselines, ts):
+            baseline_changed = True
+        elif extend_baseline(drive, baselines):
+            baseline_changed = True
+        (removable if drive["removable"] else fixed).append(drive)
+        seen_serials.add(serial)
+
+    # A permanent drive that is no longer on the bus stays in the list as
+    # present:false. Removable ones are simply gone — that is what removable
+    # means — and only produce an unplug event.
+    for serial, old in prev_by_serial.items():
+        if serial in seen_serials or serial in ignore:
+            continue
+        if old.get("removable"):
+            continue
+        fixed.append(absent_drive(old, ts))
+        log_line(f"collector\t{serial}: FIXED DRIVE ABSENT from the bus")
+
+    # Overall verdict: worst across FIXED drives only. A USB stick with no
+    # readable SMART must never turn the bar glyph red.
+    worst = overall_verdict(fixed)
+
+    cold_start = not prev_state.get("drives")
+    if cold_start:
+        log_line(f"collector\tfirst run: {len(fixed)} fixed + {len(removable)} removable drive(s) recorded, no events emitted")
+    # A permanent drive that was missing and is now back: smartd is holding a
+    # stale handle for it and must be restarted. Never on a cold start, and
+    # never for removable drives — a USB stick must not bounce the daemon.
+    if not cold_start:
+        for drive in fixed:
+            old = prev_by_serial.get(drive["serial"])
+            was_absent = old is not None and old.get("present") is False
+            never_seen = old is None
+            if (was_absent or never_seen) and drive.get("present") is not False:
+                restart_smartd(f"{drive['name']} ({drive['serial']}) is back on the bus")
+                break
+
+    events = diff_events(prev_state, fixed + removable, ts,
+                         cold_start=cold_start, ignore=ignore)
+    events += identity_events
+    for serial in collector_errors:
+        events.append(make_event(ts, serial, "collector_error", None, "unknown",
+                                 f"{serial}: the collector failed to build this drive's "
+                                 f"record; see disk-health.log"))
+    events += drain_smartd_events(ts)
+    prev_events = prev_state.get("events") or []
+    all_events = (prev_events + events)[-50:]
+
+    state = {
+        "schema": SCHEMA,
+        "collected_at": ts,
+        "collector_version": VERSION,
+        "host": socket.gethostname(),
+        "duration_ms": int((time.time() - started) * 1000),
+        "config": {"thresholds": cfg["thresholds"]},
+        "overall": {"verdict": worst, "events_pending": len(events)},
+        "drives": fixed,
+        "removable": removable,
+        "events": all_events,
+    }
+
+    # Internal carry-forward timestamps are useful while building this run but
+    # are not part of the public schema. The state-level collected_at and each
+    # drive's data_stale_since carry the two meanings explicitly.
+    for drive in fixed + removable:
+        drive.pop("_collected_at", None)
+
+    text = json.dumps(state, indent=2, sort_keys=False) + "\n"
+
+    if args.dry_run:
+        sys.stdout.write(text)
+        return 0
+
+    for drive in fixed + removable:
+        append_history(drive, ts)
+    write_atomic(state_path, text)
+    if baseline_changed:
+        write_atomic(baselines_path, json.dumps(baselines, indent=2) + "\n")
+    for event in events:
+        log_line(f"{event['kind']}\t{event['serial']}\t{event['message']}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:                                   # never die silently
+        log_line(f"collector_error\t{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        # A failed run must not leave the path-unit trigger present, otherwise
+        # systemd immediately starts failing runs until its rate limit trips.
+        try:
+            os.unlink(os.path.join(STATE_DIR, "collect.trigger"))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log_line(f"collector\tcould not remove collect.trigger: {exc}")

@@ -1,0 +1,9 @@
+[Unit]
+Description=Announce disk-health state transitions on the desktop
+Documentation=man:smartd(8)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disk-health-notify

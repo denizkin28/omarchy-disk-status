@@ -109,6 +109,8 @@ Panel {
 
   IpcHandler {
     target: "denizkin.disk-health"
+    function showPopup(): string { root.unpin(); root.open(); return "ok" }
+    function hidePopup(): string { root.close(); return "ok" }
     function showSidebar(): string { root.pin(); return "ok" }
     function hideSidebar(): string { root.unpin(); return "ok" }
     function toggleSidebar(): string { root.pinned ? root.unpin() : root.pin(); return "ok" }
