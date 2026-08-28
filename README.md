@@ -5,6 +5,13 @@ Disk health, capacity, temperature, removable-drive state, and live I/O in one l
 ![Disk Status popup dashboard](assets/screenshots/popup-dashboard.png)
 
 <details>
+<summary>Expanded drive diagnostics</summary>
+
+![Disk Status expanded diagnostic card](assets/screenshots/expanded-diagnostics.png)
+
+</details>
+
+<details>
 <summary>Persistent right-side status rail</summary>
 
 ![Disk Status pinned sidebar](assets/screenshots/pinned-sidebar.png)
